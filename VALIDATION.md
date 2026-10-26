@@ -1,6 +1,6 @@
 # Validation
 
-This document describes the independently maintained 0.1.2 candidate. The exact
+This document describes the independently maintained 0.1.3 candidate. The exact
 v0.1.1 import remains in Git history and is identified in `UPSTREAM.json`.
 All checked-in fixtures and example counters are synthetic. Keep live-provider
 credentials, account identifiers, request logs and local evidence outside Git.
@@ -113,3 +113,28 @@ implemented; tool results continue through authenticated imported history.
 
 These are explicit delivery boundaries. Neither a larger context limit, disabled
 compaction, renamed Fast alias nor an estimated flag is used as the repair.
+
+## Context growth and natural compaction
+
+`integration/context_stress.py` creates only synthetic padding/tool results and
+requires fresh receipts across every tool round. It copies an explicitly chosen
+catalog entry's existing context/compaction settings unchanged. Use `--dry-run`
+to review the workload before a real request. `--scenario approach` stays below
+the intended threshold; `--scenario cross` grows past it. The latter requires
+measured near-threshold occupancy, natural compaction, a measured decrease and
+continued correct tool results. Unknown usage or zero observed compactions is
+not sufficient to pass. Exit 2 means coverage is inconclusive; exit 1 indicates
+a functional/budget failure. The rough cost guard uses explicit assumptions and
+is not an upstream billing cap.
+
+```sh
+python3 integration/context_stress.py \
+  --codex /path/to/codex --base-url http://127.0.0.1:28347/v1 \
+  --key-file /private/isolated/keys.json \
+  --model-catalog /private/prior-model-catalog.json \
+  --catalog-slug cursor/grok-4.7@256k \
+  --output "$PWD/.local-tests/context-cross" --scenario cross
+```
+
+Use an isolated host and keep all live evidence private. A changed live catalog
+is a separate configuration change, not a reason to raise the test threshold.

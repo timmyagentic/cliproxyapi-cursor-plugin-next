@@ -34,6 +34,114 @@ type usageWindow struct {
 
 type usageFetcher func(context.Context, map[string]any) (map[string]any, error)
 
+type UsageReason string
+
+const (
+	UsageInitialWait     UsageReason = "initial_wait"
+	UsageMissing         UsageReason = "missing"
+	UsageObserving       UsageReason = "observing"
+	UsageRevised         UsageReason = "revised"
+	UsageSettled         UsageReason = "settled"
+	UsagePermission      UsageReason = "permission"
+	UsageRateLimit       UsageReason = "rate_limit"
+	UsageTimeout         UsageReason = "timeout"
+	UsageCancelled       UsageReason = "cancelled"
+	UsageAmbiguous       UsageReason = "ambiguous"
+	UsageInvalid         UsageReason = "invalid"
+	UsagePaginationLimit UsageReason = "pagination_limit"
+	UsageUpstreamError   UsageReason = "upstream_error"
+)
+
+// A stable observation means repeated snapshots agreed for the configured
+// interval. It does not prove upstream finality or a single inference step.
+// Usage contains only measured counters and opaque event metadata, never auth.
+type UsageObservation struct {
+	Usage     map[string]any
+	EventID   string
+	Stamp     int64
+	Samples   int
+	Stable    bool
+	StableFor time.Duration
+	Revised   bool
+	Reason    UsageReason
+}
+
+type UsageResolveOptions struct {
+	// The caller supplies an immutable snapshot scoped to this account. Exclude
+	// only events already proven to belong to another Run, never merely guessed
+	// by timestamps. The queried Run's own claimed event must remain eligible.
+	ExcludedEventIDs map[string]bool
+	// Optional lookup for claim indexes spanning archived journal segments.
+	// It has the same account-scoping/proven-ownership contract as the map.
+	ExcludeEvent func(eventID string) bool
+	Observe      func(UsageObservation)
+}
+
+type usageResolutionError struct {
+	reason UsageReason
+	detail string
+}
+
+func (err *usageResolutionError) Error() string {
+	return errUsageUnavailable.Error() + ": " + err.detail
+}
+func (err *usageResolutionError) Unwrap() error { return errUsageUnavailable }
+
+func usageUnavailable(reason UsageReason, detail string, args ...any) error {
+	return &usageResolutionError{reason: reason, detail: fmt.Sprintf(detail, args...)}
+}
+
+// The enum allows journal/UI callers to retain a precise non-sensitive reason
+// instead of persisting raw upstream error bodies or parsing human text.
+func UsageReasonOf(err error) UsageReason {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.Canceled) {
+		return UsageCancelled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return UsageTimeout
+	}
+	var classified *usageResolutionError
+	if errors.As(err, &classified) {
+		return classified.reason
+	}
+	switch status := errorStatus(err); {
+	case status == 401 || status == 403:
+		return UsagePermission
+	case status == 429:
+		return UsageRateLimit
+	case status >= 400 && status < 500 && status != 408:
+		return UsageInvalid
+	case status == 408:
+		return UsageTimeout
+	default:
+		return UsageUpstreamError
+	}
+}
+
+func (options UsageResolveOptions) observe(usage map[string]any, stable usageStability, reason UsageReason, revised, settled bool, at time.Time) {
+	if options.Observe == nil {
+		return
+	}
+	observation := UsageObservation{Reason: reason, Samples: stable.samples, Stable: settled, Revised: revised}
+	if usage != nil {
+		observation.Usage = copyMap(usage)
+		for _, key := range []string{"prompt_tokens_details", "completion_tokens_details"} {
+			if details := object(usage[key]); details != nil {
+				observation.Usage[key] = copyMap(details)
+			}
+		}
+		observation.EventID = str(usage["cursor_usage_event_id"])
+		observation.Stamp, _ = usageInteger(usage["cursor_usage_timestamp"])
+	}
+	if !stable.since.IsZero() && !at.Before(stable.since) {
+		observation.StableFor = at.Sub(stable.since)
+	}
+	options.Observe(observation)
+}
+
 func (p *pluginRuntime) resolveStepUsage(s *requestScope, token, cid, model string, since, until time.Time) (map[string]any, error) {
 	return resolveDashboardUsage(s.ctx, usageWindow{cid, model, since, until}, func(ctx context.Context, body map[string]any) (map[string]any, error) {
 		return s.json(ctx, http.MethodPost, "/aiserver.v1.DashboardService/GetFilteredUsageEvents", token, body)
@@ -45,32 +153,59 @@ func (p *pluginRuntime) resolveStepUsage(s *requestScope, token, cid, model stri
 // The caller must serialize account/conversation Runs and reject already used
 // event IDs: a dashboard timestamp alone is not a globally unique request ID.
 func resolveDashboardUsage(parent context.Context, window usageWindow, fetch usageFetcher, policy stepUsagePolicy) (map[string]any, error) {
+	return resolveDashboardUsageWithOptions(parent, window, fetch, policy, UsageResolveOptions{})
+}
+
+func resolveDashboardUsageWithOptions(parent context.Context, window usageWindow, fetch usageFetcher, policy stepUsagePolicy, options UsageResolveOptions) (map[string]any, error) {
 	if window.Conversation == "" || window.Model == "" || window.Since.IsZero() || window.Until.Before(window.Since) {
-		return nil, fmt.Errorf("%w: invalid Run identity", errUsageUnavailable)
+		return nil, usageUnavailable(UsageInvalid, "invalid Run identity")
 	}
 	if policy.Wait <= 0 || policy.First < 0 || policy.Ask <= 0 || policy.Interval <= 0 || policy.PageSize < 1 || policy.MaxPages < 1 || policy.Skew < 0 || policy.Stable < 0 || policy.Samples < 0 || policy.Stable > 0 && policy.Samples < 1 {
-		return nil, fmt.Errorf("%w: invalid polling limits", errUsageUnavailable)
+		return nil, usageUnavailable(UsageInvalid, "invalid polling limits")
 	}
 	ctx, cancel := context.WithTimeout(parent, policy.Wait)
 	defer cancel()
+	options.observe(nil, usageStability{}, UsageInitialWait, false, false, time.Now())
 	if err := waitUsage(ctx, policy.First); err != nil {
+		options.observe(nil, usageStability{}, UsageReasonOf(err), false, false, time.Now())
 		return nil, usageContextError(parent, err)
 	}
 	backoff := policy.Interval
 	var stability usageStability
+	var lastEvent, lastSnapshot string
 	for {
-		usage, err := fetchUsagePages(ctx, window, fetch, policy)
+		usage, err := fetchUsagePagesWithOptions(ctx, window, fetch, policy, options)
 		if ctx.Err() != nil {
+			options.observe(nil, usageStability{}, UsageReasonOf(ctx.Err()), false, false, time.Now())
 			return nil, usageContextError(parent, ctx.Err())
 		}
 		if err == nil && usage != nil {
 			// The same dashboard event may still be accumulating internal model
 			// steps after the Run closes. Stable sampling reduces that race; the
 			// API has no final marker, so it cannot prove immutable finality.
+			at := time.Now()
+			event := str(usage["cursor_usage_event_id"])
+			if lastEvent != "" && lastEvent != event {
+				options.observe(nil, usageStability{}, UsageAmbiguous, false, false, at)
+				return nil, usageUnavailable(UsageAmbiguous, "different dashboard event identities were observed for the Run")
+			}
+			snapshot := string(encodeJSON(usage))
+			revised := lastSnapshot != "" && snapshot != lastSnapshot
+			lastEvent, lastSnapshot = event, snapshot
 			if policy.Stable == 0 {
+				options.observe(usage, usageStability{samples: 1, since: at}, UsageObserving, revised, false, at)
 				return usage, nil
 			}
-			if stability.observe(usage, time.Now(), policy) {
+			settled := stability.observe(usage, at, policy)
+			reason := UsageObserving
+			if revised {
+				reason = UsageRevised
+			}
+			if settled {
+				reason = UsageSettled
+			}
+			options.observe(usage, stability, reason, revised, settled, at)
+			if settled {
 				usage["cursor_usage_stability_samples"] = stability.samples
 				return usage, nil
 			}
@@ -78,6 +213,11 @@ func resolveDashboardUsage(parent context.Context, window usageWindow, fetch usa
 			// Only consecutive complete matching snapshots establish stability.
 			// A missing event or failed query breaks that evidence window.
 			stability = usageStability{}
+			reason := UsageMissing
+			if err != nil {
+				reason = UsageReasonOf(err)
+			}
+			options.observe(nil, stability, reason, false, false, time.Now())
 		}
 		if parent.Err() != nil {
 			return nil, parent.Err()
@@ -87,7 +227,7 @@ func resolveDashboardUsage(parent context.Context, window usageWindow, fetch usa
 			// upstream error body, which can contain account information.
 			status := errorStatus(err)
 			if status >= 400 && status < 500 && status != 408 && status != 429 {
-				return nil, fmt.Errorf("%w: dashboard HTTP %d", errUsageUnavailable, status)
+				return nil, usageUnavailable(UsageReasonOf(err), "dashboard HTTP %d", status)
 			}
 			if errors.Is(err, errUsageUnavailable) {
 				return nil, err
@@ -102,6 +242,7 @@ func resolveDashboardUsage(parent context.Context, window usageWindow, fetch usa
 			backoff = policy.Interval
 		}
 		if err := waitUsage(ctx, backoff); err != nil {
+			options.observe(nil, usageStability{}, UsageReasonOf(err), false, false, time.Now())
 			return nil, usageContextError(parent, err)
 		}
 	}
@@ -127,7 +268,7 @@ func usageContextError(parent context.Context, err error) error {
 	if parent.Err() != nil {
 		return parent.Err()
 	}
-	return fmt.Errorf("%w: dashboard polling deadline (%v)", errUsageUnavailable, err)
+	return usageUnavailable(UsageTimeout, "dashboard polling deadline")
 }
 
 func waitUsage(ctx context.Context, delay time.Duration) error {
@@ -145,6 +286,10 @@ func waitUsage(ctx context.Context, delay time.Duration) error {
 }
 
 func fetchUsagePages(ctx context.Context, window usageWindow, fetch usageFetcher, policy stepUsagePolicy) (map[string]any, error) {
+	return fetchUsagePagesWithOptions(ctx, window, fetch, policy, UsageResolveOptions{})
+}
+
+func fetchUsagePagesWithOptions(ctx context.Context, window usageWindow, fetch usageFetcher, policy stepUsagePolicy, options UsageResolveOptions) (map[string]any, error) {
 	// Do not return a first-page candidate until all pages were inspected:
 	// another page may contain a second, ambiguous event for this Run.
 	found := make(map[string]map[string]any)
@@ -164,10 +309,10 @@ func fetchUsagePages(ctx context.Context, window usageWindow, fetch usageFetcher
 			events, ok = nil, true
 		}
 		if !ok {
-			return nil, fmt.Errorf("%w: invalid dashboard event list", errUsageUnavailable)
+			return nil, usageUnavailable(UsageInvalid, "invalid dashboard event list")
 		}
 		if len(events) > policy.PageSize {
-			return nil, fmt.Errorf("%w: dashboard page exceeds requested size", errUsageUnavailable)
+			return nil, usageUnavailable(UsageInvalid, "dashboard page exceeds requested size")
 		}
 		for _, rawEvent := range events {
 			event := object(rawEvent)
@@ -175,9 +320,12 @@ func fetchUsagePages(ctx context.Context, window usageWindow, fetch usageFetcher
 				continue
 			}
 			id := usageEventID(event)
+			if options.ExcludedEventIDs[id] || options.ExcludeEvent != nil && options.ExcludeEvent(id) {
+				continue
+			}
 			candidates[id] = struct{}{}
 			if len(candidates) > 1 {
-				return nil, fmt.Errorf("%w: multiple dashboard events match the Run", errUsageUnavailable)
+				return nil, usageUnavailable(UsageAmbiguous, "multiple dashboard events match the Run")
 			}
 			tokenMessage := object(event["tokenUsage"])
 			// An event may be published before its measurement is populated.
@@ -187,28 +335,28 @@ func fetchUsagePages(ctx context.Context, window usageWindow, fetch usageFetcher
 			}
 			usage, err := dashboardUsage(tokenMessage)
 			if err != nil {
-				return nil, fmt.Errorf("%w: %v", errUsageUnavailable, err)
+				return nil, usageUnavailable(UsageInvalid, "%v", err)
 			}
 			usage["cursor_usage_source"] = "dashboard"
 			usage["cursor_usage_event_id"] = id
 			usage["cursor_usage_timestamp"], _ = usageInteger(event["timestamp"])
 			if previous, exists := found[id]; exists && string(encodeJSON(previous)) != string(encodeJSON(usage)) {
-				return nil, fmt.Errorf("%w: conflicting copies of a dashboard event", errUsageUnavailable)
+				return nil, usageUnavailable(UsageAmbiguous, "conflicting copies of a dashboard event")
 			}
 			found[id] = usage
 		}
 		if len(found) > 1 {
-			return nil, fmt.Errorf("%w: multiple dashboard events match the Run", errUsageUnavailable)
+			return nil, usageUnavailable(UsageAmbiguous, "multiple dashboard events match the Run")
 		}
 		done := len(events) < policy.PageSize
 		if rawCount, exists := data["totalUsageEventsCount"]; exists {
 			count, valid := usageInteger(rawCount)
 			if !valid || count < int64((page-1)*policy.PageSize+len(events)) {
-				return nil, fmt.Errorf("%w: invalid dashboard event count", errUsageUnavailable)
+				return nil, usageUnavailable(UsageInvalid, "invalid dashboard event count")
 			}
 			done = int64((page-1)*policy.PageSize+len(events)) == count
 			if len(events) < policy.PageSize && !done {
-				return nil, fmt.Errorf("%w: incomplete dashboard pagination", errUsageUnavailable)
+				return nil, usageUnavailable(UsageInvalid, "incomplete dashboard pagination")
 			}
 		}
 		if done {
@@ -218,7 +366,7 @@ func fetchUsagePages(ctx context.Context, window usageWindow, fetch usageFetcher
 			return nil, nil
 		}
 	}
-	return nil, fmt.Errorf("%w: dashboard pagination limit reached", errUsageUnavailable)
+	return nil, usageUnavailable(UsagePaginationLimit, "dashboard pagination limit reached")
 }
 
 func usageEventMatches(event map[string]any, window usageWindow, skew time.Duration) bool {

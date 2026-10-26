@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const version = "0.1.2"
+const version = "0.1.3"
 const pluginID = "cursor-next"
 const pluginLogo = "https://raw.githubusercontent.com/timmyagentic/cliproxyapi-cursor-plugin-next/main/assets/cursor.png"
 const cursorAPI = "https://api2.cursor.sh"
@@ -145,7 +145,7 @@ type pluginRuntime struct {
 	usageRuns      sync.WaitGroup
 	streamWorkers  sync.WaitGroup
 	journalPath    string
-	reconcileNext  map[string]int
+	reconciling    map[string]bool
 }
 
 func newRuntime() *pluginRuntime {

@@ -21,6 +21,7 @@ type runEvent struct {
 	usage           map[string]any
 	accounting      map[string]any
 	internalCalls   int
+	internalSteps   int
 	err             error
 }
 type runState struct {
@@ -31,6 +32,7 @@ type runState struct {
 	blobs                          map[string][]byte
 	seen                           map[string]string
 	internalCalls                  int
+	internalSteps                  int
 }
 
 var maxModeRequired = regexp.MustCompile(`(?i)max[ _]mode[ _]required|requires max mode`)
@@ -252,12 +254,24 @@ func (p *pluginRuntime) run(s *requestScope, token string, model modelResolution
 		started := p.now()
 		record, err := p.journal.Begin(account, cid, requestID, model.ID, started)
 		if err != nil {
-			emit(runEvent{err: failure(503, "Cursor usage journal is unavailable")})
-			return
+			// Accounting is best effort when storage/identity admission fails.
+			// Keep an opaque correlation ID and let the successful model reply
+			// report unknown usage rather than failing for a journal problem.
+			record.ID = digest(account + "\x00" + requestID)
 		}
 		defer func() {
 			_ = p.journal.Close(record.ID, p.now())
 		}()
+		// Revisit older observations while this Run is working, within this
+		// request's callback lifetime. No credential-bearing background worker
+		// survives completion and reconciliation adds no serial polling delay.
+		reviewCtx, stopReview := context.WithCancel(s.ctx)
+		reviewDone := make(chan struct{})
+		go func() {
+			defer close(reviewDone)
+			p.reconcileUsageContext(reviewCtx, s, token, account, record.ID)
+		}()
+		defer func() { stopReview(); <-reviewDone }()
 		h := headers(token)
 		h.Set("Content-Type", "application/connect+proto")
 		h.Set("Accept-Encoding", "identity")
@@ -375,9 +389,7 @@ func (p *pluginRuntime) run(s *requestScope, token string, model modelResolution
 		_ = resp.Body.Close()
 		<-senderDone
 		ended := p.now()
-		if closeErr := p.journal.Close(record.ID, ended); closeErr != nil {
-			err = failure(503, "Cursor usage journal could not persist Run completion")
-		}
+		_ = p.journal.Close(record.ID, ended)
 		if err == nil && terminal.stop != "" {
 			terminal = p.accountUsage(s, token, account, record.ID, cid, model.ID, started, ended, terminal)
 			if s.ctx.Err() == nil {
@@ -406,7 +418,7 @@ func (st *runState) finished() runEvent {
 	if st.calls > 0 {
 		stop = "tool_calls"
 	}
-	return runEvent{stop: stop, usage: usage, internalCalls: st.internalCalls}
+	return runEvent{stop: stop, usage: usage, internalCalls: st.internalCalls, internalSteps: st.internalSteps}
 }
 func usageFromFields(fs []pbField) map[string]any {
 	// An empty/malformed usage update is unknown, not an exact zero count.
@@ -557,6 +569,7 @@ func (st *runState) decode(reader io.Reader, send func([]byte) error, emit func(
 				}
 				st.listed = 0
 				st.answered = 0
+				st.internalSteps++
 			}
 		}
 	}

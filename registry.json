@@ -6,7 +6,7 @@
       "name": "Cursor Next",
       "description": "Independently maintained Cursor provider with measured tool-step usage, separate deferred accounting, streaming, images, tools and quota support.",
       "author": "timmyagentic",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "repository": "https://github.com/timmyagentic/cliproxyapi-cursor-plugin-next",
       "homepage": "https://github.com/timmyagentic/cliproxyapi-cursor-plugin-next",
       "license": "MIT",

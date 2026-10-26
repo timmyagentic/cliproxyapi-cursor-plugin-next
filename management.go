@@ -27,7 +27,10 @@ func (p *pluginRuntime) registerManagement(req rpcRequest) any {
 	p.managementBase, p.resourceBase = base, resource
 	p.mu.Unlock()
 	return map[string]any{
-		"routes":    []any{map[string]any{"Method": "POST", "Path": base + "/plugins/" + pluginID + "/api-key"}},
+		"routes": []any{
+			map[string]any{"Method": "POST", "Path": base + "/plugins/" + pluginID + "/api-key"},
+			map[string]any{"Method": "GET", "Path": base + "/plugins/" + pluginID + "/accounting"},
+		},
 		"resources": []any{map[string]any{"Path": resource + "/login", "Menu": "Cursor", "Description": "Cursor API Key 登录"}},
 	}
 }
@@ -47,6 +50,15 @@ func (p *pluginRuntime) handleManagement(s *requestScope, req rpcRequest) (any, 
 		return nil, failure(503, "Cursor management routes are not registered")
 	}
 	endpoint := base + "/plugins/" + pluginID + "/api-key"
+	if req.Method == http.MethodGet && req.Path == base+"/plugins/"+pluginID+"/accounting" {
+		// This authenticated management route exposes only health counters, not
+		// credentials, journal paths, event identities, or conversation contents.
+		p.mu.Lock()
+		health := p.journal.Health()
+		active := len(p.usageActive)
+		p.mu.Unlock()
+		return managementResponse(200, "application/json", encodeJSON(map[string]any{"journal": health, "active_runs": active, "version": version})), nil
+	}
 	if req.Method == http.MethodGet && req.Path == resource+"/login" {
 		var body bytes.Buffer
 		if err := loginTemplate.Execute(&body, map[string]string{"Endpoint": endpoint, "Logo": pluginLogo}); err != nil {

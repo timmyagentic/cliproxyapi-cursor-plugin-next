@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -30,7 +31,7 @@ func (p *pluginRuntime) acquireUsageRun(account, cid string) error {
 	if p.closed {
 		return failure(503, "Cursor plugin is shut down")
 	}
-	if p.journalErr != nil || p.journal == nil {
+	if p.journal == nil {
 		return failure(503, "Cursor usage journal is unavailable")
 	}
 	key := account + "\x00" + cid
@@ -49,17 +50,30 @@ func (p *pluginRuntime) releaseUsageRun(account, cid string) {
 	p.usageRuns.Done()
 }
 
-// A dashboard timestamp is not a request ID. Even a single returned candidate
-// must be rejected when it could belong to another Run, including a cancelled
-// or restarted Run. A stable conversation ID is retained for upstream caching.
+// Timestamps alone cannot prove ownership. Once a different event is claimed
+// for another Run, its overlapping timestamp window no longer makes the current
+// event ambiguous. Unresolved overlapping Runs remain a reason to omit usage.
 func (p *pluginRuntime) unambiguousUsage(account, cid, id string, usage map[string]any) bool {
 	stamp, ok := usageInteger(usage["cursor_usage_timestamp"])
 	if !ok {
 		return false
 	}
+	eventID := str(usage["cursor_usage_event_id"])
+	if eventID != "" {
+		owner, err := p.journal.ClaimOwner(account, eventID)
+		if err != nil || owner != "" && owner != id {
+			return false
+		}
+		if owner == id {
+			return true
+		}
+	}
 	at := time.UnixMilli(stamp)
 	for _, record := range p.journal.Records() {
 		if record.ID == id || record.Account != account || record.Conversation != cid {
+			continue
+		}
+		if eventID != "" && record.Source == "dashboard" && record.EventID != "" && record.EventID != eventID {
 			continue
 		}
 		end := record.Ended
@@ -80,85 +94,156 @@ func publicUsage(usage map[string]any) map[string]any {
 	result := copyMap(usage)
 	delete(result, "cursor_usage_event_id")
 	delete(result, "cursor_usage_timestamp")
+	delete(result, "cursor_usage_stability_samples")
 	return result
+}
+
+// resolveRunUsage journals successive observations, including changed counters
+// for the same event, before deciding whether a settled snapshot can be returned.
+// A storage or attribution failure never turns a successful model reply into 503.
+func (p *pluginRuntime) resolveRunUsage(ctx context.Context, s *requestScope, token, account, id string, window usageWindow, policy stepUsagePolicy, deferred bool) (map[string]any, error) {
+	var observationErr error
+	options := UsageResolveOptions{
+		ExcludeEvent: func(eventID string) bool {
+			owner, err := p.journal.ClaimOwner(account, eventID)
+			if err != nil {
+				observationErr = err
+				return true
+			}
+			return owner != "" && owner != id
+		},
+		Observe: func(observation UsageObservation) {
+			if observation.Usage == nil {
+				return
+			}
+			if !p.unambiguousUsage(account, window.Conversation, id, observation.Usage) {
+				observationErr = usageUnavailable(UsageAmbiguous, "overlapping unresolved Run")
+				return
+			}
+			if err := p.journal.ObserveSnapshot(id, observation.Usage, "dashboard", deferred, observation.Stable); err != nil {
+				observationErr = err
+			} else {
+				observationErr = nil
+			}
+		},
+	}
+	usage, err := resolveDashboardUsageWithOptions(ctx, window, func(ctx context.Context, body map[string]any) (map[string]any, error) {
+		return s.json(ctx, http.MethodPost, "/aiserver.v1.DashboardService/GetFilteredUsageEvents", token, body)
+	}, policy, options)
+	if observationErr != nil {
+		return nil, observationErr
+	}
+	if err != nil || usage == nil {
+		return nil, err
+	}
+	if !p.unambiguousUsage(account, window.Conversation, id, usage) {
+		return nil, usageUnavailable(UsageAmbiguous, "overlapping unresolved Run")
+	}
+	return usage, nil
 }
 
 func (p *pluginRuntime) accountUsage(s *requestScope, token, account, id, cid, model string, started, ended time.Time, terminal runEvent) runEvent {
 	_ = p.journal.SetInternalToolCalls(id, terminal.internalCalls)
+	_ = p.journal.SetInternalSteps(id, terminal.internalSteps)
 	source := "turn_ended"
 	usage := terminal.usage
+	var err error
 	if usage == nil && s.ctx.Err() == nil {
 		source = "dashboard"
-		usage, _ = resolveDashboardUsage(s.ctx, usageWindow{cid, model, started, ended}, func(ctx context.Context, body map[string]any) (map[string]any, error) {
-			return s.json(ctx, http.MethodPost, "/aiserver.v1.DashboardService/GetFilteredUsageEvents", token, body)
-		}, p.usagePolicy)
-		if usage != nil && !p.unambiguousUsage(account, cid, id, usage) {
-			usage = nil
-		}
-	}
-	if usage != nil {
-		if err := p.journal.Complete(id, usage, source); err != nil {
-			// A failed durable claim must not publish a potentially duplicate count.
-			usage = nil
-		}
+		usage, err = p.resolveRunUsage(s.ctx, s, token, account, id, usageWindow{cid, model, started, ended}, p.usagePolicy, false)
+	} else if usage != nil {
+		// Native counters arrive directly on this Run and need no timestamp
+		// attribution. Keep that valid measurement even if the independent
+		// audit journal is unavailable; its health remains visible below.
+		err = p.journal.Complete(id, usage, source)
 	}
 	terminal.usage = publicUsage(usage)
-	if source == "dashboard" && terminal.internalCalls > 0 {
-		// A Run that handled native discovery/rejected tools can contain several
-		// inference steps. Its dashboard counter is a Run total, not the current
-		// prompt size. Keep that billing observation only in the journal.
+	if terminal.internalCalls > 0 || terminal.internalSteps > 0 {
+		// Both TurnEnded and Dashboard usage can total several model calls.
+		// Keep the Run observation, but never report that sum as current context.
 		terminal.usage = nil
 	}
 	if usage == nil {
-		_ = p.journal.MarkUnknown(id, "unavailable")
-		terminal.accounting = map[string]any{"state": "unknown", "record_id": id, "reason": "authoritative_usage_unavailable"}
+		reason := UsageReasonOf(err)
+		if s.ctx.Err() != nil {
+			reason = UsageCancelled
+		}
+		if reason == "" {
+			reason = UsageMissing
+		}
+		_ = p.journal.MarkUnknown(id, string(reason))
+		terminal.accounting = map[string]any{"state": "unknown", "record_id": id, "reason": string(reason)}
 	} else {
-		terminal.accounting = map[string]any{"state": "measured", "source": source, "record_id": id}
+		terminal.accounting = map[string]any{"state": "measured", "source": source, "record_id": id, "provisional": true, "usage_scope": "run"}
+		if samples, ok := usage["cursor_usage_stability_samples"]; ok {
+			terminal.accounting["stability_samples"] = samples
+		}
 	}
 	terminal.accounting["internal_tool_calls"] = terminal.internalCalls
+	terminal.accounting["observed_internal_steps"] = terminal.internalSteps
+	terminal.accounting["journal"] = p.journal.Health()
+	if source == "turn_ended" && usage != nil {
+		terminal.accounting["journal_recorded"] = err == nil
+	}
 	if usage != nil && terminal.usage == nil {
 		terminal.accounting["state"] = "context_unknown"
-		terminal.accounting["reason"] = "dashboard_counts_multiple_inference_steps"
+		terminal.accounting["reason"] = "run_counts_multiple_inference_steps"
+	} else if usage != nil {
+		// No visible internal tool batch is a useful guard, not evidence that
+		// the upstream made exactly one model call. Do not claim finality.
+		terminal.accounting["context_basis"] = "no_observed_internal_steps"
 	}
-	// Historical measurements remain in their own journal records. The standard
-	// usage object above always describes this request, never a sum of requests.
-	p.reconcileUsage(s, token, account, id)
 	return terminal
 }
 
 func (p *pluginRuntime) reconcileUsage(s *requestScope, token, account, current string) {
-	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
+	p.reconcileUsageContext(s.ctx, s, token, account, current)
+}
+
+func (p *pluginRuntime) reconcileUsageContext(parent context.Context, s *requestScope, token, account, current string) {
+	p.mu.Lock()
+	if p.reconciling == nil {
+		p.reconciling = make(map[string]bool)
+	}
+	if p.reconciling[account] {
+		p.mu.Unlock()
+		return
+	}
+	p.reconciling[account] = true
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		delete(p.reconciling, account)
+		p.mu.Unlock()
+	}()
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
 	defer cancel()
-	pending := p.journal.Pending(account, current)
+	pending := p.journal.Reviewable(account, current)
 	if len(pending) == 0 {
 		return
 	}
-	p.mu.Lock()
-	if p.reconcileNext == nil {
-		p.reconcileNext = make(map[string]int)
-	}
-	start := p.reconcileNext[account] % len(pending)
-	p.mu.Unlock()
-	for i := 0; i < len(pending) && i < 4; i++ {
-		if ctx.Err() != nil {
-			return
+	// The journal supplies a bounded fair batch including previously measured
+	// Dashboard events, whose counters may still change. All candidates receive
+	// the same settling checks as the current Run, never a one-snapshot backfill.
+	policy := p.usagePolicy
+	policy.Wait, policy.First = 2*time.Second, 0
+	var workers sync.WaitGroup
+	for i, record := range pending {
+		if i == 4 || ctx.Err() != nil {
+			break
 		}
-		index := (start + i) % len(pending)
-		record := pending[index]
-		p.mu.Lock()
-		p.reconcileNext[account] = (index + 1) % len(pending)
-		p.mu.Unlock()
-		usage, err := fetchUsagePages(ctx, usageWindow{record.Conversation, record.Model, record.Started, record.Ended}, func(ctx context.Context, body map[string]any) (map[string]any, error) {
-			return s.json(ctx, http.MethodPost, "/aiserver.v1.DashboardService/GetFilteredUsageEvents", token, body)
-		}, p.usagePolicy)
-		if err != nil {
-			if status := errorStatus(err); status == 401 || status == 403 || status == 429 {
-				return
+		workers.Add(1)
+		go func(record usageRecord) {
+			defer workers.Done()
+			_, err := p.resolveRunUsage(ctx, s, token, account, record.ID, usageWindow{record.Conversation, record.Model, record.Started, record.Ended}, policy, true)
+			reason := UsageReasonOf(err)
+			if err != nil {
+				_ = p.journal.MarkUnknown(record.ID, string(reason))
 			}
-			continue
-		}
-		if usage != nil && p.unambiguousUsage(account, record.Conversation, record.ID, usage) {
-			_ = p.journal.CompleteDeferred(record.ID, usage, "dashboard")
-		}
+			if reason == UsagePermission || reason == UsageRateLimit {
+				cancel()
+			}
+		}(record)
 	}
+	workers.Wait()
 }

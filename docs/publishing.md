@@ -1,7 +1,7 @@
 # Publishing
 
 The independent plugin ID is `cursor-next`; the auth provider/model prefix stays
-`cursor`. Version 0.1.2 is a candidate until separately approved for release.
+`cursor`. Version 0.1.3 is a candidate until separately approved for release.
 
 Pull requests and pushes to main run the native Linux AMD64/ARM64, macOS
 AMD64/ARM64 and Windows AMD64 build/test matrix. No release is created by a PR

@@ -39,6 +39,21 @@ Tested source revisions:
 - CPA 8.0.38: `0db19025571684b198a2ef508f99b41c717337e8`.
 - CPA 8.0.43: `307803510bce87f986fcf7b1a84190f105c7b4aa`.
 
+## Proposed upstream host fix (not a released CPA version)
+
+The separate [plugin-usage-presence patch](https://github.com/router-for-me/CLIProxyAPI/pull/7012) on top of CPA 8.0.43 has passed the real
+C-ABI twelve-case suite with `--expect-patched`. It changes only the plugin path:
+missing measurements have `quality=unclassified` and an explicit `observed`
+field-presence object; authoritative zero remains distinguishable. Responses
+retains cache-write detail and omits unobserved reasoning instead of inventing
+zero. Streaming and nonstreaming cases are checked independently. Legacy
+non-plugin producers keep their existing default contract.
+
+This patch does not add an estimated-usage protocol or a late-correction
+callback. A custom extension still cannot make guessed standard counters safe.
+The installed released host must not be assumed to contain these changes merely
+because this candidate passed its tests.
+
 ## Reproduce the offline host test
 
 Requires Python 3, PyYAML, Go 1.23+, a C compiler, and a CPA binary for the same
@@ -134,3 +149,15 @@ cancellation. A plugin cannot guarantee an explicit close after the host has
 already invalidated its callbacks. Do not hot-swap a plugin with active client
 streams; finish or cancel them first. The isolated test runner terminates its
 own listener before loading another library in a fresh process.
+
+A separate [upstream lifecycle patch](https://github.com/router-for-me/CLIProxyAPI/pull/7013) binds async executor streams to their exact
+plugin instance. Its tests cover idle and blocked consumers, pending executor
+calls, reloaded instances, and partial replies interrupted by unload. This is
+independent of usage presence and is not included in released 8.0.43.
+
+When a reasoning counter is unknown, an empty `output_tokens_details: {}` is
+also unsafe: Codex requires `reasoning_tokens` when that object is present. The
+proposed patch removes an empty details object entirely while preserving other
+detail fields and explicit zero counters. The isolated Codex probe records
+terminal parse errors as well as HTTP status so a successful transport alone
+cannot pass this compatibility check.

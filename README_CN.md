@@ -8,4 +8,10 @@
 
 使用 `make test`、`make build` 构建，macOS 产物为 `dist/cursor-next.dylib`。插件 ID 为 `cursor-next`，provider 仍为 `cursor`。持久化计量需在插件配置里设置 `usage-journal`，目录权限为 0700、文件为 0600；不设置时仅保存在内存中。完整配置见[英文说明](README.md)。
 
-这是 0.1.2 源码/构建候选，不会自动替换现用插件或发布。先按[验证说明](VALIDATION.md)运行独立宿主，再按[安装与回退方案](docs/installation-and-rollback.md)切换。
+这是 0.1.3 源码/构建候选，不会自动替换现用插件或发布。先按[验证说明](VALIDATION.md)运行独立宿主，再按[安装与回退方案](docs/installation-and-rollback.md)切换。
+
+0.1.3 增加同一事件的初始值、最新值和修订记录；复查也要求稳定采样。
+账本容量、写盘或路径故障会显示降级，不再让成功的模型回答变成 503。
+可通过宿主鉴权保护的 `/v0/management/plugins/cursor-next/accounting` 查看健康状态。
+内部多步 Run 的 Dashboard 与 TurnEnded 合计都不会冒充单步上下文；
+Cursor 未提供可验证的逐步用量或最终标记，这一边界仍然存在。

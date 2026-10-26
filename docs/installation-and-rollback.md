@@ -57,10 +57,17 @@ closed pending Runs can be reconciled by later requests. A Run whose close time
 was lost stays `unknown/interrupted` and is not automatically matched against a
 broad timestamp range.
 
-Pending observations expire from automatic lookup after seven days while their
-unknown audit records remain. The snapshot is bounded at 10000 records/16 MiB;
-at capacity the journal rejects new Runs rather than silently discarding billing
-evidence. Archive/rotate it offline only after stopping its host, retain the old
-file as private evidence, and start with a new journal path. In-memory mode has
-the same bound but no restart recovery. This limit is explicit operational scope,
-not an automatic claim that old unknown usage was zero.
+Unresolved active observations expire from automatic lookup after seven days.
+The v2 active checkpoint stays bounded at 10,000 records/16 MiB; older entries
+are retained in private append-only segments, with separate event-claim digests.
+Capacity and storage failures no longer reject model Runs. A bounded memory
+spool reports backlog, dropped observations and audit loss; it is not durable
+across a crash. Cold archive reconciliation is an offline operation. Monitor
+`GET /v0/management/plugins/cursor-next/accounting` using host management auth.
+
+Preserve the complete journal family (`usage.json`, its stable `.lock` file,
+`.segments/`, and `.claims/`) for audit or offline archival. Never share one path
+between active processes or edit live segments. V1 imports retain the original
+snapshot as `import-v1.json`; v2 is not readable by a v1-only plugin, so use a
+separate journal path if rolling back the candidate. The original installed
+`spx-cursor` library and its configuration remain independent.

@@ -82,9 +82,16 @@ def main(args):
                     assert usage["input_tokens"] == 140260
                     assert usage["output_tokens"] == 669
                     assert usage["input_tokens_details"]["cached_tokens"] == 140160
-                    expected_reasoning = 0 if scenario == "reasoning-unknown" else 200
-                    assert usage["output_tokens_details"]["reasoning_tokens"] == expected_reasoning
-                    assert "cache_write_tokens" not in usage["input_tokens_details"], "host behavior changed: reassess compatibility document"
+                    if args.expect_patched:
+                        assert usage["input_tokens_details"]["cache_write_tokens"] == 20
+                        if scenario == "reasoning-unknown":
+                            assert "reasoning_tokens" not in usage.get("output_tokens_details", {})
+                        else:
+                            assert usage["output_tokens_details"]["reasoning_tokens"] == 200
+                    else:
+                        expected_reasoning = 0 if scenario == "reasoning-unknown" else 200
+                        assert usage["output_tokens_details"]["reasoning_tokens"] == expected_reasoning
+                        assert "cache_write_tokens" not in usage["input_tokens_details"], "host behavior changed: reassess compatibility document"
                     assert "cursor_usage_estimated" not in usage and "cursor_deferred" not in usage
                 report.append({"scenario": scenario, "stream": stream, "client_usage": usage})
         time.sleep(.2)
@@ -96,16 +103,23 @@ def main(args):
             assert not record["failed"]
             if scenario == "unknown":
                 assert record["tokens"]["total_tokens"] == 0
-                assert record["token_breakdown"]["quality"] == "complete", "host behavior changed: unknown no longer misclassified"
+                assert record["token_breakdown"]["quality"] == ("unclassified" if args.expect_patched else "complete")
+                if args.expect_patched:
+                    assert not any(record["token_breakdown"]["observed"].values())
             elif scenario != "zero":
                 assert record["token_breakdown"]["input"]["cache_write_tokens"] == 20
                 assert record["token_breakdown"]["input"]["uncached_tokens"] == 80
                 assert record["token_breakdown"]["output"]["reasoning_tokens"] == (0 if scenario == "reasoning-unknown" else 200)
-                assert record["token_breakdown"]["quality"] == "complete"
+                expected_quality = "unclassified" if args.expect_patched and scenario == "reasoning-unknown" else "complete"
+                assert record["token_breakdown"]["quality"] == expected_quality
+                if args.expect_patched:
+                    assert record["token_breakdown"]["observed"]["reasoning_tokens"] == (scenario != "reasoning-unknown")
         # The host queue contains the local client key. Keep only accounting.
         sanitized = [{k: record[k] for k in ("model", "stream", "tokens", "token_breakdown", "failed")} for record in records]
-        result = {"responses": report, "records": sanitized,
-            "limitations": ["missing usage becomes zero complete in CPA recorder", "cache-write detail omitted by Responses translator", "estimated and deferred extensions dropped", "unknown reasoning presence becomes explicit zero in CPA and Responses"]}
+        limits = ["custom estimated/deferred extensions have no supported host contract", "no late-correction callback"]
+        if not args.expect_patched:
+            limits += ["missing usage becomes zero complete in CPA recorder", "cache-write detail omitted by Responses translator", "unknown reasoning presence becomes explicit zero in CPA and Responses"]
+        result = {"responses": report, "records": sanitized, "patched_host": args.expect_patched, "limitations": limits}
         (root / "result.json").write_text(json.dumps(result, indent=2))
         print(f"PASS: {2 * len(scenarios)} real-host synthetic cases; scenarios={','.join(scenarios)}")
     finally:
@@ -123,5 +137,6 @@ if __name__ == "__main__":
     parser.add_argument("--cpa-binary", type=Path, required=True)
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--port", type=int, default=28348)
+    parser.add_argument("--expect-patched", action="store_true", help="assert the upstream plugin-usage presence fix")
     parser.add_argument("--scenario", action="append", choices=("known", "unknown", "zero", "estimated", "deferred", "reasoning-unknown"), help="run only selected scenario(s)")
     main(parser.parse_args())

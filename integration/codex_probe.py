@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import secrets
 import subprocess
 import threading
@@ -219,7 +220,12 @@ stream_max_retries = 0
         send("turn/start", {"threadId": tid, "input": [{"type": "text", "text": prompt, "text_elements": []}]}, 3)
         done = receive_until(lambda e: e.get("method") == "turn/completed")
         texts = [e["item"].get("text", "") for e in events if e.get("method") == "item/completed" and e.get("item", {}).get("type") == "agentMessage"]
-        result["completed"] = done.get("params", {}).get("turn", {}).get("status") == "completed"
+        turn = done.get("params", {}).get("turn", {})
+        result["completed"] = turn.get("status") == "completed"
+        if turn.get("error"):
+            detail = json.dumps(turn["error"]).replace(key, "[redacted]")
+            detail = re.sub(r"(?i)(bearer\s+|token[=:]\s*|api[-_]?key[=:]\s*)[^\s,\"}]+", r"\1[redacted]", detail)
+            result["turn_error"] = detail[:3000]
         result["verified_marker"] = any(text.strip() == marker for text in texts)
         result["compactions"] = sum(e.get("method") == "item/completed" and e.get("item", {}).get("type") == "contextCompaction" for e in events)
         result["tools"] = calls

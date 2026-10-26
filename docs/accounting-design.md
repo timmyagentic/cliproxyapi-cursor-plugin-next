@@ -23,8 +23,8 @@ Controlled live validation showed that one `usageEventId` can retain its identit
 while its input, cached-input, and output counters increase after the Run closes.
 A first populated event is therefore insufficient evidence of a final count.
 For the current Run, the polling resolver requires at least three complete,
-matching snapshots spanning at least one second. Any counter or event-identity
-change resets the sampling window;
+matching snapshots spanning at least one second. A counter revision resets the sampling window; switching event identities is
+ambiguous and rejected;
 an absent event or failed lookup also resets it. Pagination must complete for
 each sample. The initial delay, sampling, retries, and pagination all share the
 same 8 second budget. A value that has not stabilized before that deadline stays
@@ -38,10 +38,12 @@ change again after the sampling window or after a response was delivered. A
 later change to an already recorded event must be treated as a correction or a
 conflict; it cannot justify silently claiming the earlier value was absolutely
 final. Stable totals may also aggregate multiple internal model steps of a Run.
-The decoder counts native tool-discovery/refusal calls. If those occur before a
-caller tool batch, Dashboard usage is retained as a Run observation in the journal
-and standard context usage is omitted (`context_unknown` at the plugin boundary).
-The aggregate is never presented as one model step's context size.
+The decoder records native tool-discovery/refusal calls and completed internal
+tool batches separately. Both Dashboard and native `TurnEnded` totals are retained
+as Run observations when such work occurs; standard context usage is omitted (`context_unknown` at the plugin boundary).
+The aggregate is never presented as one model step's context size. No observed
+internal batch is only a guard: the protocol exposes no verified per-inference
+context counter, so zero observed batches does not prove a single inference.
 
 ## Counter contract
 
@@ -86,8 +88,10 @@ be polled again.
 
 The runtime serializes Runs for the same account/conversation, preserves its
 stable conversation ID for upstream prompt-cache affinity, and uses its journal
-to reject a claim that overlaps another Run's window or an event already claimed
-by that account. Distinct accounts and conversations may run concurrently.
+to reject an event already claimed by that account. Other Runs with a proven
+distinct event no longer make an overlapping timestamp ambiguous. An overlapping
+unresolved Run remains ambiguous. Known other-Run event IDs are excluded before
+counting candidates; timestamps never authorize reuse of an event. Distinct accounts and conversations may run concurrently.
 The resolver itself retains no token, account-global cache, or background job.
 The separate one-shot page-collection helper performs matching and pagination
 without a settling wait; a single helper result does not establish stability.
@@ -118,3 +122,37 @@ and ambiguous events, permissions, rate limits, retries, cancellation, HTTP
 timeouts, and account isolation through the actual host callback interface.
 It uses synthetic values and no network or real credentials. The multi-tool
 dispatch and real-host suites exercise integration beyond this resolver.
+
+## Revision journal and availability
+
+All observations remain provisional. `FirstUsage` preserves the initial value;
+`Usage` is the latest observation and `Revision` increases when the same event's
+counters change. A bounded observation history retains changes and identity
+conflicts, while durable log segments retain older entries. `Stable` means only
+that consecutive samples agreed, not that Cursor finalized the event. A review
+failure preserves the last observation and records the reason; it does not
+replace known data with zero. Revisions replace a view of one charge, never add
+another charge or alter a later response's current-context counters.
+
+Historical checks use the same resolver as the current request, with no initial
+delay and at most four concurrent candidates within two seconds. They run while
+the current native Run is working. Request completion/cancellation drains the
+worker before callbacks close; no credential survives in a background worker.
+Previously measured and deferred Dashboard observations are eligible again.
+Active candidates rotate fairly; cold archived records require offline review.
+
+The v2 journal retains at most 10,000 active records and a 16 MiB checkpoint,
+rotates small append-only segments, and keeps account/event ownership digests.
+A bounded 512-entry/4 MiB in-memory spool absorbs write failures; exhausted spool
+space is reported through dropped-observation counters. Corrupt, insecure or
+already-owned paths are not overwritten. They enter degraded operation while
+model replies continue. Unknown ownership suppresses Dashboard counters.
+Memory-only overflow reports audit loss and cannot guarantee claims across
+eviction/restart. Segments are audit archives, not an unlimited-storage promise;
+archive/retention remains an operator responsibility. OS file syscalls themselves
+have no Go deadline.
+
+The authenticated accounting management endpoint exposes health only. A host
+that drops custom response fields can still inspect degradation there. Schema v1
+is imported without deleting its original bytes, and interrupted active Runs
+remain audit records with no invented broad reconciliation window.

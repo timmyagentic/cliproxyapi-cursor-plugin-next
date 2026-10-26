@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -238,29 +237,393 @@ func TestUsageJournalSnapshotIsolationExpiryAndCapacity(t *testing.T) {
 	if j.Records()[1].Usage.PromptTokens != 100 || *j.Records()[1].Usage.ReasoningTokens != 3 {
 		t.Fatal("exporter mutated owned measurements")
 	}
-	// Exercise the hard cap without discarding any existing audit information.
-	j.records = append(j.records, make([]usageRecord, maxUsageJournalRecords-len(j.records))...)
-	if _, err := j.Begin("account", "conversation", "capacity", "grok-4.7", now); !errors.Is(err, errUsageJournalCapacity) || len(j.records) != maxUsageJournalRecords {
-		t.Fatal("capacity silently dropped audit records or grew without a bound", err)
+	// Memory-only storage cannot archive; continue with explicit loss health.
+	j.capacity = len(j.records)
+	if _, err := j.Begin("account", "conversation", "capacity", "grok-4.7", now); err != nil || len(j.records) != j.capacity || j.Health().LostRecords == 0 {
+		t.Fatal("capacity failed execution or hid memory audit loss", err)
 	}
 }
 
-func TestUsageJournalPersistenceFailureDoesNotCommitClaim(t *testing.T) {
+func TestUsageJournalPersistenceFailurePreservesUnverifiedObservation(t *testing.T) {
 	j := testUsageJournal(t, true)
 	r := journalClosed(t, j, "account", "run", time.Now().Add(-time.Minute))
 	original := j.path
 	j.path = filepath.Join(j.path, "missing", "cannot-write")
-	if err := j.Complete(r.ID, journalUsage(100, 90, 1, 10, "event"), "dashboard"); err == nil || j.Records()[0].Usage != nil {
-		t.Fatal("failed durable write committed an in-memory event claim")
+	if err := j.Complete(r.ID, journalUsage(100, 90, 1, 10, "event"), "dashboard"); err == nil || j.Records()[0].Usage != nil || len(j.Records()[0].Observations) != 1 || j.Records()[0].Observations[0].Kind != "unverified" || j.Health().State != "degraded" {
+		t.Fatal("unreadable claim storage was represented as verified ownership", err)
 	}
 	j.path = original
+	if health := j.Flush(); health.State != "healthy" || health.SpoolRecords != 0 {
+		t.Fatal("recovered storage did not flush the bounded spool", health)
+	}
 	if err := j.Complete(r.ID, journalUsage(100, 90, 1, 10, "event"), "dashboard"); err != nil {
-		t.Fatal("retry after failed durable write could not claim its event", err)
+		t.Fatal("fresh observation after storage recovery was not accepted", err)
+	}
+}
+
+func TestUsageJournalRevisionsRemainProvisionalAndReplaceOneEvent(t *testing.T) {
+	j := testUsageJournal(t, true)
+	now := time.Now().UTC()
+	j.now = func() time.Time { return now }
+	r := journalClosed(t, j, "account", "revision-run", now.Add(-time.Minute))
+	first := journalUsage(100, 90, 1, 10, "stable-event")
+	if err := j.ObserveSnapshot(r.ID, first, "dashboard", false, false); err != nil {
+		t.Fatal(err)
+	}
+	sequence := j.Health().Sequence
+	now = now.Add(time.Second)
+	if err := j.ObserveSnapshot(r.ID, first, "dashboard", false, false); err != nil {
+		t.Fatal(err)
+	}
+	if j.Health().Sequence != sequence {
+		t.Fatal("same-value sample wrote another durable update")
+	}
+	now = now.Add(time.Second)
+	if err := j.ObserveSnapshot(r.ID, first, "dashboard", false, true); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := j.Record(r.ID)
+	if before.Revision != 1 || before.Samples != 3 || !before.Stable || !before.Provisional || before.FirstUsage.PromptTokens != 100 {
+		t.Fatal("stable sampling was mislabeled as final", before)
+	}
+	now = now.Add(time.Second)
+	second := journalUsage(150, 140, 2, 20, "stable-event")
+	if err := j.ObserveSnapshot(r.ID, second, "dashboard", false, false); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := j.Record(r.ID)
+	if after.Revision != 2 || after.Usage.PromptTokens != 150 || after.FirstUsage.PromptTokens != 100 || after.Stable || len(after.Observations) != 2 || after.Observations[1].Kind != "revision" {
+		t.Fatal("revision was frozen, summed, or lost first evidence", after)
+	}
+	if err := j.MarkUnknown(r.ID, "upstream_error"); err != nil {
+		t.Fatal(err)
+	}
+	failed, _ := j.Record(r.ID)
+	if failed.Usage.PromptTokens != 150 || failed.FirstUsage.PromptTokens != 100 || failed.Reason != "upstream_error" || failed.Revision != 2 {
+		t.Fatal("failed recheck discarded prior evidence")
+	}
+	if err := j.Complete(r.ID, journalUsage(170, 160, 1, 21, "conflicting-event"), "dashboard"); err != errUsageEventConflict {
+		t.Fatal("different event was silently substituted", err)
+	}
+	conflicted, _ := j.Record(r.ID)
+	if conflicted.Usage.PromptTokens != 150 || conflicted.Revision != 2 || conflicted.Conflicts != 1 || conflicted.Observations[len(conflicted.Observations)-1].Kind != "conflict" {
+		t.Fatal("event conflict was not separately retained")
+	}
+	j.Flush()
+	path := j.path
+	_ = j.Shutdown()
+	reopened, err := newUsageJournal(path)
+	if err != nil || reopened.Health().State != "healthy" {
+		t.Fatal("revised journal did not restart cleanly", err)
+	}
+	defer reopened.Shutdown()
+	persisted, _ := reopened.Record(r.ID)
+	if persisted.Revision != 2 || persisted.Usage.PromptTokens != 150 || persisted.FirstUsage.PromptTokens != 100 || persisted.Conflicts != 1 || !persisted.Provisional {
+		t.Fatal("revision evidence did not survive restart")
+	}
+}
+
+func TestUsageJournalCapacityArchivesAndKeepsCrossSegmentClaims(t *testing.T) {
+	j := testUsageJournal(t, true)
+	j.capacity = 3
+	now := time.Now().UTC()
+	var first usageRecord
+	for n := 0; n < 7; n++ {
+		r := journalClosed(t, j, "account", fmt.Sprintf("archive-run-%d", n), now.Add(time.Duration(n-60)*time.Second))
+		if n == 0 {
+			first = r
+		}
+		if err := j.Complete(r.ID, journalUsage(int64(100+n), 90, 1, 10, fmt.Sprintf("archive-event-%d", n)), "dashboard"); err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			j.segmentBytes = maxUsageSegmentBytes
+		}
+	}
+	if len(j.Records()) != 3 || j.Health().State != "healthy" || j.Health().Segments < 2 {
+		t.Fatal("capacity aborted execution or grew without a bound", j.Health())
+	}
+	archived, ok := j.Record(first.ID)
+	if !ok || archived.Usage.PromptTokens != 100 {
+		t.Fatal("archival discarded old audit evidence")
+	}
+	owner, err := j.ClaimOwner("account", digest("archive-event-0"))
+	if err != nil || owner != first.ID {
+		t.Fatal("archived event claim was forgotten", err)
+	}
+	current := journalClosed(t, j, "account", "duplicate-archive-event", now)
+	if err := j.Complete(current.ID, journalUsage(100, 90, 1, 10, "archive-event-0"), "dashboard"); err != errUsageEventClaimed {
+		t.Fatal("old archived event was billed again", err)
+	}
+	path := j.path
+	j.Flush()
+	_ = j.Shutdown()
+	reopened, err := newUsageJournal(path)
+	if err != nil || reopened.Health().State != "healthy" {
+		t.Fatal("archive failed restart", err)
+	}
+	defer reopened.Shutdown()
+	if owner, err := reopened.ClaimOwner("account", digest("archive-event-0")); err != nil || owner != first.ID {
+		t.Fatal("restart lost archived ownership", err)
+	}
+	if archived, ok := reopened.Record(first.ID); !ok || archived.Usage.PromptTokens != 100 {
+		t.Fatal("restart lost archived record")
+	}
+}
+
+func TestUsageJournalEvictedUnresolvedWindowBlocksNewAttributionAcrossRestart(t *testing.T) {
+	j := testUsageJournal(t, true)
+	j.capacity = 2
+	now := time.Now().Add(-time.Minute)
+	known := journalClosed(t, j, "account", "known-claim", now)
+	if err := j.Complete(known.ID, journalUsage(100, 90, 1, 10, "known-event"), "dashboard"); err != nil {
+		t.Fatal(err)
+	}
+	_ = journalClosed(t, j, "account", "unknown-window", now.Add(time.Second))
+	_ = journalClosed(t, j, "account", "newer-window", now.Add(2*time.Second))
+	_ = journalClosed(t, j, "account", "newest-window", now.Add(3*time.Second))
+	if !j.Health().AttributionIncomplete {
+		t.Fatal("evicted unresolved window silently lost attribution evidence")
+	}
+	if owner, err := j.ClaimOwner("account", digest("known-event")); err != nil || owner != known.ID {
+		t.Fatal("conservative fallback lost a known archived claim", err)
+	}
+	if owner, err := j.ClaimOwner("account", digest("unseen-event")); err == nil || owner != "" {
+		t.Fatal("new event attributed after unresolved window was evicted")
+	}
+	path := j.path
+	j.Flush()
+	_ = j.Shutdown()
+	reopened, err := newUsageJournal(path)
+	if err != nil || !reopened.Health().AttributionIncomplete {
+		t.Fatal("restart erased incomplete attribution state", err)
+	}
+	defer reopened.Shutdown()
+	if _, err := reopened.ClaimOwner("account", digest("unseen-after-restart")); err == nil {
+		t.Fatal("restart allowed unproven event ownership")
+	}
+}
+
+func TestUsageJournalV1UpgradePreservesOriginalAndSeedsClaims(t *testing.T) {
+	memory := testUsageJournal(t, false)
+	r := journalClosed(t, memory, "account", "legacy-run", time.Now().Add(-time.Minute))
+	if err := memory.Complete(r.ID, journalUsage(100, 90, 1, 10, "legacy-event"), "dashboard"); err != nil {
+		t.Fatal(err)
+	}
+	legacy, _ := memory.Record(r.ID)
+	legacy.Sequence, legacy.Revision, legacy.Samples = 0, 0, 0
+	legacy.Provisional, legacy.Stable, legacy.FirstUsage, legacy.Observations = false, false, nil, nil
+	legacy.ObservedAt, legacy.ReviewedAt = time.Time{}, time.Time{}
+	raw, _ := json.Marshal(usageJournalSnapshot{Version: 1, Records: []usageRecord{legacy}})
+	dir := filepath.Join(t.TempDir(), "private")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "usage.json")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	j, err := newUsageJournal(path)
+	if err != nil || j.Health().State != "healthy" {
+		t.Fatal("v1 journal could not migrate", err, j.Health())
+	}
+	defer j.Shutdown()
+	backup, err := os.ReadFile(filepath.Join(path+".segments", "import-v1.json"))
+	if err != nil || string(backup) != string(raw) {
+		t.Fatal("migration altered original v1 bytes")
+	}
+	j.capacity = 1
+	if _, err := j.Begin("account", "conversation", "new-after-v1", "grok-4.7", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if owner, err := j.ClaimOwner("account", digest("legacy-event")); err != nil || owner != r.ID {
+		t.Fatal("v1 event lost its persistent claim on eviction", err)
+	}
+	upgraded, ok := j.Record(r.ID)
+	if !ok || upgraded.Revision != 1 || !upgraded.Provisional || upgraded.FirstUsage.PromptTokens != 100 {
+		t.Fatal("migration lost provisional first observation")
+	}
+}
+
+func TestUsageJournalBoundedSpoolReportsLossAndFlushesAfterRecovery(t *testing.T) {
+	j := testUsageJournal(t, true)
+	j.spoolCapacity = 3
+	segments := j.path + ".segments"
+	saved := segments + ".saved"
+	if err := os.Rename(segments, saved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(segments, []byte("synthetic obstruction"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Add(-time.Minute)
+	for n := 0; n < 5; n++ {
+		r := journalClosed(t, j, "account", fmt.Sprintf("spooled-%d", n), now)
+		if err := j.Complete(r.ID, journalUsage(100, 90, 1, 10, fmt.Sprintf("spooled-event-%d", n)), "dashboard"); err != nil {
+			t.Fatal("spool failure aborted model accounting", err)
+		}
+	}
+	health := j.Health()
+	if health.State != "degraded" || health.SpoolRecords > 3 || health.SpoolBytes > maxUsageSpoolBytes || health.DroppedObservations == 0 {
+		t.Fatal("spool grew unbounded or hid dropped evidence", health)
+	}
+	if err := os.Remove(segments); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(saved, segments); err != nil {
+		t.Fatal(err)
+	}
+	health = j.Flush()
+	if health.SpoolRecords != 0 || health.State != "degraded" || health.Reason != "audit_loss" || health.DroppedObservations == 0 {
+		t.Fatal("recovery did not flush or concealed prior loss", health)
+	}
+	for _, record := range j.Records() {
+		if record.Usage == nil || record.Usage.PromptTokens != 100 || !record.Provisional {
+			t.Fatal("recovery lost current provisional observations")
+		}
+	}
+	path := j.path
+	_ = j.Shutdown()
+	reopened, err := newUsageJournal(path)
+	if err != nil || reopened.Health().DroppedObservations != health.DroppedObservations || reopened.Health().State != "degraded" {
+		t.Fatal("restart hid historical loss", err)
+	}
+	defer reopened.Shutdown()
+}
+
+func TestUsageJournalReviewableRotatesFourIncludingCurrentAndDeferred(t *testing.T) {
+	j := testUsageJournal(t, false)
+	now := time.Now().Add(-time.Minute)
+	for n := 0; n < 11; n++ {
+		r := journalClosed(t, j, "account", fmt.Sprintf("review-%d", n), now)
+		var err error
+		if n%2 == 0 {
+			err = j.Complete(r.ID, journalUsage(100, 90, 1, 10, fmt.Sprintf("review-event-%d", n)), "dashboard")
+		} else {
+			err = j.CompleteDeferred(r.ID, journalUsage(100, 90, 1, 10, fmt.Sprintf("review-event-%d", n)), "dashboard")
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := map[string]bool{}
+	for n := 0; n < 3; n++ {
+		batch := j.Reviewable("account", "")
+		if len(batch) > 4 {
+			t.Fatal("review batch would skip unseen candidates when truncated")
+		}
+		for _, r := range batch {
+			seen[r.ID] = true
+		}
+	}
+	if len(seen) != 11 {
+		t.Fatal("review cursor starved earlier observations", len(seen))
+	}
+	if len(j.Reviewable("another-account", "")) != 0 {
+		t.Fatal("review crossed account boundaries")
+	}
+}
+
+func TestUsageJournalIdempotenceDoesNotWriteAgain(t *testing.T) {
+	j := testUsageJournal(t, true)
+	r := journalClosed(t, j, "account", "idempotent-run", time.Now().Add(-time.Minute))
+	usage := journalUsage(100, 90, 1, 10, "idempotent-event")
+	if err := j.Complete(r.ID, usage, "dashboard"); err != nil {
+		t.Fatal(err)
+	}
+	j.Flush()
+	sequence := j.Health().Sequence
+	before, _ := os.ReadFile(j.path)
+	if err := j.Close(r.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Complete(r.ID, usage, "dashboard"); err != nil {
+		t.Fatal(err)
+	}
+	j.Flush()
+	after, _ := os.ReadFile(j.path)
+	if j.Health().Sequence != sequence || string(before) != string(after) {
+		t.Fatal("idempotent callbacks triggered another checkpoint/write")
+	}
+}
+
+func TestUsageJournalRevisionHistoryBoundKeepsOlderEvidenceInSegments(t *testing.T) {
+	j := testUsageJournal(t, true)
+	now := time.Now().UTC()
+	j.now = func() time.Time { return now }
+	r := journalClosed(t, j, "account", "many-revisions", now.Add(-time.Minute))
+	for n := 0; n < 40; n++ {
+		now = now.Add(time.Second)
+		if err := j.ObserveSnapshot(r.ID, journalUsage(int64(100+n), 90, 1, 10, "same-revised-event"), "dashboard", false, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	current, _ := j.Record(r.ID)
+	if len(current.Observations) != maxUsageHistory || current.HistoryArchived != 8 || current.Revision != 40 || current.Samples != 1 || current.FirstUsage.PromptTokens != 100 || current.Usage.PromptTokens != 139 {
+		t.Fatal("history was unbounded or revision counters accumulated", current)
+	}
+	oldestFound := false
+	if err := j.walkLog(func(entry usageLogEntry) error {
+		if entry.Record.ID == r.ID && entry.Record.Revision == 1 && entry.Record.Usage.PromptTokens == 100 {
+			oldestFound = true
+		}
+		return nil
+	}); err != nil || !oldestFound {
+		t.Fatal("bounded active history discarded older audit evidence", err)
+	}
+}
+
+func TestUsageJournalUnsafeSegmentIsNotOpenedOrOverwritten(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink privilege is not assumed")
+	}
+	j := testUsageJournal(t, true)
+	r, err := j.Begin("account", "conversation", "unsafe-segment-run", "grok-4.7", time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := j.segmentPath(j.segment)
+	if err := os.Rename(name, name+".saved"); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(filepath.Dir(j.path), "synthetic-untouched")
+	const original = "synthetic bytes must remain unchanged"
+	if err := os.WriteFile(target, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, name); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Close(r.ID, time.Now()); err != nil {
+		t.Fatal("unsafe storage aborted model execution", err)
+	}
+	got, _ := os.ReadFile(target)
+	if string(got) != original || j.Health().Reason != "unsafe_path" {
+		t.Fatal("unsafe segment was opened before validation")
+	}
+}
+
+func TestUsageJournalModelPathDoesNotScanArchive(t *testing.T) {
+	j := testUsageJournal(t, true)
+	// A deliberately unreadable historical import would fail an archive scan.
+	legacy := filepath.Join(j.path+".segments", "import-v1.json")
+	if err := os.WriteFile(legacy, []byte("synthetic invalid historical fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r := journalClosed(t, j, "account", "hot-path-run", time.Now().Add(-time.Minute))
+	if err := j.Complete(r.ID, journalUsage(100, 90, 1, 10, "hot-path-event"), "dashboard"); err != nil {
+		t.Fatal(err)
+	}
+	if len(j.Reviewable("account", "")) != 1 || j.Health().Reason == "archive_unavailable" {
+		t.Fatal("model hot path scanned historical archive")
+	}
+	if _, ok := j.Record(digest("synthetic-absent-record")); ok || j.Health().Reason != "archive_unavailable" {
+		t.Fatal("explicit offline archive lookup did not surface corruption")
 	}
 }
 
 func TestUsageJournalRejectsCorruptionAndInsecurePaths(t *testing.T) {
-	for _, raw := range []string{`{`, `{"version":2,"records":[]}`, `{"version":1,"records":[],"token":"forbidden"}`, `{"version":1,"records":[]} {}`} {
+	for _, raw := range []string{`{`, `{"version":3,"records":[]}`, `{"version":1,"records":[],"token":"forbidden"}`, `{"version":1,"records":[]} {}`} {
 		dir := filepath.Join(t.TempDir(), "private")
 		if err := os.Mkdir(dir, 0700); err != nil {
 			t.Fatal(err)
@@ -269,9 +632,14 @@ func TestUsageJournalRejectsCorruptionAndInsecurePaths(t *testing.T) {
 		if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if j, err := newUsageJournal(path); err == nil {
-			_ = j.Shutdown()
-			t.Fatal("corrupt snapshot was accepted")
+		j, err := newUsageJournal(path)
+		if err != nil || j.Health().State != "degraded" {
+			t.Fatal("corruption did not degrade accounting")
+		}
+		_ = j.Shutdown()
+		preserved, _ := os.ReadFile(path)
+		if string(preserved) != raw {
+			t.Fatal("corrupt original was overwritten")
 		}
 	}
 	if runtime.GOOS != "windows" {
@@ -279,10 +647,11 @@ func TestUsageJournalRejectsCorruptionAndInsecurePaths(t *testing.T) {
 		if err := os.Mkdir(dir, 0755); err != nil {
 			t.Fatal(err)
 		}
-		if j, err := newUsageJournal(filepath.Join(dir, "usage.json")); err == nil {
-			_ = j.Shutdown()
-			t.Fatal("journal accepted a nonprivate directory")
+		j, err := newUsageJournal(filepath.Join(dir, "usage.json"))
+		if err != nil || j.Health().Reason != "unsafe_path" {
+			t.Fatal("unsafe path did not degrade accounting")
 		}
+		_ = j.Shutdown()
 	}
 }
 
@@ -333,9 +702,10 @@ func TestUsageJournalProcessCrashReleasesLockAndRetainsUnknownAudit(t *testing.T
 	case <-time.After(10 * time.Second):
 		t.Fatal("child journal setup timed out")
 	}
-	if j, err := newUsageJournal(path); err == nil {
+	if j, err := newUsageJournal(path); err != nil || j.Health().Reason != "already_owned" {
+		t.Fatal("second process did not refuse shared persistent ownership")
+	} else {
 		_ = j.Shutdown()
-		t.Fatal("two processes acquired the same journal")
 	}
 	if err = cmd.Process.Kill(); err != nil {
 		t.Fatal(err)
@@ -379,8 +749,9 @@ func TestUsageJournalReloadRejectsDuplicateEventClaims(t *testing.T) {
 	if err := os.WriteFile(path, raw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if reopened, err := newUsageJournal(path); err == nil {
+	if reopened, err := newUsageJournal(path); err != nil || reopened.Health().State != "degraded" {
+		t.Fatal("duplicate persisted claims did not degrade accounting")
+	} else {
 		_ = reopened.Shutdown()
-		t.Fatal("duplicate persisted event claims were accepted")
 	}
 }
