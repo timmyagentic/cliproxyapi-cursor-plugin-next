@@ -15,6 +15,9 @@ import sys
 
 
 COUNTERS = ("input_tokens", "uncached_tokens", "cached_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens", "total_tokens")
+PRESENCE = {"input_tokens": "input_tokens", "cached_tokens": "cache_read_tokens",
+            "cache_write_tokens": "cache_write_tokens", "output_tokens": "output_tokens",
+            "reasoning_tokens": "reasoning_tokens", "total_tokens": "total_tokens"}
 
 
 def milliseconds(value):
@@ -71,17 +74,57 @@ def cpa_counts(record):
     tokens = record["tokens"]
     if "cached_tokens" in tokens and "cache_read_tokens" in tokens and tokens["cached_tokens"] != tokens["cache_read_tokens"]:
         raise ValueError("CPA cached and cache-read counters disagree")
-    return counts(tokens.get("input_tokens"), tokens.get("cache_read_tokens", tokens.get("cached_tokens")), tokens.get("cache_creation_tokens"), tokens.get("output_tokens"), tokens.get("total_tokens"), tokens.get("reasoning_tokens"))
+    result = counts(tokens.get("input_tokens"), tokens.get("cache_read_tokens", tokens.get("cached_tokens")), tokens.get("cache_creation_tokens"), tokens.get("output_tokens"), tokens.get("total_tokens"), tokens.get("reasoning_tokens"))
+    observed = record["token_breakdown"].get("observed")
+    if observed is None:
+        return result
+    if not isinstance(observed, dict) or any(type(observed.get(key)) is not bool for key in PRESENCE.values()):
+        raise ValueError("CPA observed presence must contain boolean counters")
+    for key, flag in PRESENCE.items():
+        known = observed[flag] or key == "total_tokens" and observed["input_tokens"] and observed["output_tokens"]
+        if not known:
+            if result[key] not in (None, 0):
+                raise ValueError("CPA unobserved counter is nonzero: " + key)
+            result[key] = None
+    return counts(result["input_tokens"], result["cached_tokens"], result["cache_write_tokens"], result["output_tokens"], result["total_tokens"], result["reasoning_tokens"])
 
 
 def breakdown_counts(record):
     breakdown = record["token_breakdown"]
     inp, out = breakdown["input"], breakdown["output"]
-    result = counts(inp.get("total_tokens"), inp.get("cache_read_tokens"), inp.get("cache_write_tokens"), out.get("total_tokens"), breakdown.get("total_tokens"), out.get("reasoning_tokens"))
-    if result["uncached_tokens"] != inp.get("uncached_tokens"):
+    # Classified input/output buckets need not equal raw parent counters: an
+    # unknown subdivision belongs in unclassified_tokens, not a fabricated zero.
+    classified = integer(inp.get("total_tokens")) + integer(out.get("total_tokens"))
+    result = counts(inp.get("total_tokens"), inp.get("cache_read_tokens"), inp.get("cache_write_tokens"), out.get("total_tokens"), classified, out.get("reasoning_tokens"))
+    if result["uncached_tokens"] != integer(inp.get("uncached_tokens")):
         raise ValueError("CPA uncached breakdown inconsistent")
-    if result["output_tokens"] - result["reasoning_tokens"] != out.get("non_reasoning_tokens"):
+    if result["output_tokens"] - result["reasoning_tokens"] != integer(out.get("non_reasoning_tokens")):
         raise ValueError("CPA output breakdown inconsistent")
+    unclassified = integer(breakdown.get("unclassified_tokens", 0))
+    result["total_tokens"] = integer(breakdown.get("total_tokens"))
+    result["unclassified_tokens"] = unclassified
+    if result["total_tokens"] != classified + unclassified:
+        raise ValueError("CPA classified and unclassified total inconsistent")
+    quality = breakdown.get("quality")
+    if quality not in ("complete", "unclassified") or quality == "complete" and unclassified:
+        raise ValueError("CPA breakdown quality inconsistent")
+    observed = breakdown.get("observed")
+    if observed is not None:
+        raw = cpa_counts(record)
+        expected = {"uncached_tokens": raw["uncached_tokens"] or 0,
+                    "cached_tokens": raw["cached_tokens"] or 0,
+                    "cache_write_tokens": raw["cache_write_tokens"] or 0,
+                    "reasoning_tokens": raw["reasoning_tokens"] or 0}
+        expected["input_tokens"] = sum(expected[key] for key in ("uncached_tokens", "cached_tokens", "cache_write_tokens"))
+        non_reasoning = raw["output_tokens"] - raw["reasoning_tokens"] if None not in (raw["output_tokens"], raw["reasoning_tokens"]) else 0
+        expected["output_tokens"] = non_reasoning + expected["reasoning_tokens"]
+        expected["total_tokens"] = integer(record["tokens"]["total_tokens"])
+        expected["unclassified_tokens"] = expected["total_tokens"] - expected["input_tokens"] - expected["output_tokens"]
+        if any(result[key] != value for key, value in expected.items()):
+            raise ValueError("CPA breakdown does not match observed classifications")
+        wanted_quality = "unclassified" if unclassified or not any(observed.values()) else "complete"
+        if quality != wanted_quality:
+            raise ValueError("CPA observed breakdown quality inconsistent")
     return result
 
 
@@ -110,6 +153,11 @@ def differences(expected, actual, label, optional=()):
         if expected[key] != actual[key]:
             failures.append(f"{label}.{key}: expected {expected[key]}, observed {actual[key]}")
     return failures
+
+
+def invented_measurements(expected, actual, label):
+    return [f"{label}.{key}: unknown counter published as {actual[key]}"
+            for key in COUNTERS if expected[key] is None and actual[key] is not None]
 
 
 def build_report(records, emitted, queue, events):
@@ -143,40 +191,77 @@ def build_report(records, emitted, queue, events):
                 errors.append("dashboard event identity changed")
         upstream = dashboard_counts(event["tokenUsage"])
         observed = journal_counts(record["usage"]) if record.get("usage") is not None else None
+        first = journal_counts(record["first_usage"]) if record.get("first_usage") is not None else observed
+        revised = first != observed or record.get("revision", 1) > 1
+        history = [journal_counts(item["usage"]) for item in record.get("observations", [])
+                   if item.get("usage") is not None and item.get("kind") in ("observation", "revision")
+                   and item.get("event_id") == record.get("event_id") and item.get("source") == record.get("source")]
         if observed is not None:
-            errors += differences(upstream, observed, "journal")
+            latest_differences = differences(upstream, observed, "journal")
+            if record.get("provisional") and record.get("source") == "dashboard":
+                if latest_differences:
+                    limitations.append("dashboard changed since latest journal observation; counters remain provisional")
+            else:
+                errors += latest_differences
         else:
             limitations.append("journal measurement remains unknown")
         client_raw = client_rows[index].get("usage")
         client = None if client_raw is None else client_counts(client_raw)
         cpa = cpa_counts(billed_rows[index])
         breakdown = breakdown_counts(billed_rows[index])
-        context_unknown = bool(record.get("internal_tool_calls")) or observed is None
+        presence = billed_rows[index]["token_breakdown"].get("observed")
+        context_unknown = bool(record.get("internal_tool_calls") or record.get("internal_steps")) or observed is None
         if context_unknown:
             if client is not None:
                 errors.append("unknown current context was published as standard client usage")
-            zeros = {key: 0 for key in COUNTERS}
-            errors += differences(zeros, cpa, "CPA unknown-placeholder")
-            errors += differences(zeros, breakdown, "CPA unknown-placeholder-breakdown")
-            limitations.append("CPA records unknown as zero with quality=" + str(billed_rows[index]["token_breakdown"].get("quality")))
+            if presence is None:
+                zeros = {key: 0 for key in COUNTERS}
+                errors += differences(zeros, cpa, "CPA unknown-placeholder")
+                errors += differences(zeros, breakdown, "CPA unknown-placeholder-breakdown")
+                limitations.append("CPA records unknown as zero with quality=" + str(billed_rows[index]["token_breakdown"].get("quality")))
+            elif any(presence.values()):
+                errors.append("CPA unknown context contains observed counters")
+            else:
+                limitations.append("CPA presence marks unknown counters; zero storage fields are not measurements")
         elif client is None:
             errors.append("measured current context missing from client response")
         else:
-            errors += differences(upstream, client, "Responses", optional=("cache_write_tokens", "uncached_tokens"))
-            errors += differences(observed, client, "Responses-vs-journal", optional=("cache_write_tokens", "uncached_tokens"))
-            errors += differences(upstream, cpa, "CPA")
-            errors += differences(upstream, breakdown, "CPA breakdown")
-            errors += differences(observed, cpa, "CPA-vs-journal")
-            errors += differences(observed, breakdown, "CPA-breakdown-vs-journal")
+            reference = observed
+            optional = ("cache_write_tokens", "uncached_tokens") if presence is None else ()
+            if revised:
+                # A revision is another observation of the same Run, not another
+                # bill or proof that the original response used the latest value.
+                matches = [snapshot for snapshot in [first, *history, observed] if snapshot is not None
+                           and not differences(snapshot, client, "Responses", optional)
+                           and not differences(snapshot, cpa, "CPA")]
+                if matches:
+                    reference = matches[0]
+                limitations.append("journal counters revised; response/CPA checked against a recorded snapshot, emission revision is not recorded")
+                if not matches:
+                    errors.append("response and CPA do not match the same recorded journal snapshot")
+            elif not record.get("provisional"):
+                errors += differences(upstream, client, "Responses", optional=optional)
+                errors += differences(upstream, cpa, "CPA")
+                if presence is None:
+                    errors += differences(upstream, breakdown, "CPA breakdown")
+            errors += differences(reference, client, "Responses-vs-journal", optional=optional)
+            errors += differences(reference, cpa, "CPA-vs-journal")
+            if presence is None:
+                errors += differences(reference, breakdown, "CPA-breakdown-vs-journal")
+            else:
+                errors += invented_measurements(reference, client, "Responses")
+                errors += invented_measurements(reference, cpa, "CPA")
             if client["cache_write_tokens"] is None:
                 limitations.append("Responses host omits cache-write detail")
-            if billed_rows[index]["token_breakdown"].get("quality") != "complete":
+            if presence is None and billed_rows[index]["token_breakdown"].get("quality") != "complete":
                 errors.append("CPA measured token breakdown is not complete")
         if billed_rows[index].get("failed"):
             errors.append("CPA request marked failed")
         report.append({"step": index + 1, "passed": not errors, "internal_tool_calls": record.get("internal_tool_calls", 0),
             "source": record.get("source"), "client_alignment": client_alignment, "cpa_alignment": "unique request start time",
             "dashboard_later": upstream, "journal_observed": observed, "responses": client, "cpa_tokens": cpa, "cpa_breakdown": breakdown,
+            "journal_first": first, "journal_latest": observed, "journal_revision": record.get("revision", 1),
+            "journal_changed": revised, "journal_provisional": bool(record.get("provisional")), "cpa_observed": presence,
             "context_unknown": context_unknown, "run_total_withheld_from_context": context_unknown and client is None,
             "errors": errors, "limitations": limitations})
     return {"passed": all(row["passed"] for row in report), "rows": report}
@@ -199,7 +284,14 @@ def compare(root, summary_path=None, cpa_path=None):
         emitted = json.loads((summary_path or root / "controlled-summary.json").read_text())
         if isinstance(emitted, dict):
             emitted = emitted["requests"]
-        records = json.loads((root / "journal/usage.json").read_text())["records"]
+        # Offline comparison consumes the stopped instance's final checkpoint;
+        # it does not reconstruct a live v2 checkpoint from WAL segments.
+        snapshot = json.loads((root / "journal/usage.json").read_text())
+        if snapshot.get("version", 1) not in (1, 2):
+            raise ValueError("unsupported journal checkpoint version")
+        if snapshot.get("attribution_incomplete") or snapshot.get("lost_records") or snapshot.get("dropped_observations"):
+            raise ValueError("journal checkpoint reports incomplete attribution")
+        records = snapshot["records"]
         queue = json.loads((cpa_path or root / "controlled-usage-queue.json").read_text())
         auth = json.loads((root / "oauth/cursor-test.json").read_text())["cursor_auth"]
         token = cursor("/auth/exchange_user_api_key", auth["key"], {})["accessToken"] if auth["type"] == "api" else auth["access"]
