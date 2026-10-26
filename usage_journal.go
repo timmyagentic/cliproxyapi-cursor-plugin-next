@@ -540,6 +540,22 @@ func (j *usageJournal) claimOwnerLocked(account, event string) (string, error) {
 		return "", errUsageJournal
 	}
 	name := j.claimPath(account, event)
+	// A missing leaf proves absence only under an available claim store. In
+	// particular, Windows can report PATH_NOT_FOUND when a parent is a file;
+	// interpreting that as an unclaimed event would invent ownership evidence.
+	if !privateUsagePath(j.path+".claims", true) {
+		j.storageReason = "claim_unavailable"
+		return "", errUsageJournal
+	}
+	if _, err := os.Lstat(filepath.Dir(name)); err == nil {
+		if !privateUsagePath(filepath.Dir(name), true) {
+			j.storageReason = "claim_unavailable"
+			return "", errUsageJournal
+		}
+	} else if !os.IsNotExist(err) {
+		j.storageReason = "claim_unavailable"
+		return "", errUsageJournal
+	}
 	raw, err := readUsageFile(name)
 	if os.IsNotExist(err) {
 		if j.attributionIncomplete {
@@ -560,6 +576,11 @@ func (j *usageJournal) claimPath(account, event string) string {
 func (j *usageJournal) persistClaim(r usageRecord) error {
 	if r.EventID == "" {
 		return nil
+	}
+	// The root was created when this journal acquired storage ownership. Do
+	// not silently recreate a missing root and forget its older claim digests.
+	if !privateUsagePath(j.path+".claims", true) {
+		return errUsageJournal
 	}
 	name := j.claimPath(r.Account, r.EventID)
 	if raw, err := readUsageFile(name); err == nil {
@@ -906,6 +927,22 @@ func (j *usageJournal) flushSpool() {
 	if j.blocked || j.lock == nil || len(j.spool) == 0 {
 		return
 	}
+	// Validate the parent before classifying a missing segment leaf. A missing
+	// directory or a regular-file obstruction is an availability failure: keep
+	// the bounded spool and retry after the owner restores storage. Symlinks or
+	// nonprivate directories remain unsafe and must never be opened for append.
+	segmentDir := j.path + ".segments"
+	if info, err := os.Lstat(segmentDir); err != nil || !info.IsDir() {
+		j.storageReason = "write_failed"
+		if err == nil && info.Mode()&os.ModeSymlink != 0 {
+			j.storageReason, j.blocked = "unsafe_path", true
+		}
+		return
+	}
+	if !privateUsagePath(segmentDir, true) {
+		j.storageReason, j.blocked = "unsafe_path", true
+		return
+	}
 	for len(j.spool) > 0 {
 		if j.segment == 0 || j.segmentBytes >= maxUsageSegmentBytes {
 			j.segment++
@@ -938,10 +975,6 @@ func (j *usageJournal) flushSpool() {
 			created = true
 		} else {
 			j.storageReason = "write_failed"
-			return
-		}
-		if !privateUsagePath(j.path+".segments", true) {
-			j.storageReason, j.blocked = "unsafe_path", true
 			return
 		}
 		file, err := os.OpenFile(name, flags, 0600)

@@ -261,6 +261,74 @@ func TestUsageJournalPersistenceFailurePreservesUnverifiedObservation(t *testing
 	}
 }
 
+func TestUsageJournalClaimAbsenceRequiresAvailableDirectoryStructure(t *testing.T) {
+	for _, scenario := range []struct {
+		name      string
+		wantError bool
+	}{
+		{"missing-shard", false},
+		{"missing-leaf", false},
+		{"missing-root", true},
+		{"root-is-file", true},
+		{"shard-is-file", true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			j := testUsageJournal(t, true)
+			event := digest("synthetic-directory-check-event")
+			root := j.path + ".claims"
+			shard := filepath.Dir(j.claimPath(journalAccountHash("account"), event))
+			switch scenario.name {
+			case "missing-leaf":
+				if err := os.Mkdir(shard, 0700); err != nil {
+					t.Fatal(err)
+				}
+			case "missing-root", "root-is-file":
+				if err := os.Rename(root, root+".saved"); err != nil {
+					t.Fatal(err)
+				}
+				if scenario.name == "root-is-file" {
+					if err := os.WriteFile(root, []byte("synthetic obstruction"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "shard-is-file":
+				if err := os.WriteFile(shard, []byte("synthetic obstruction"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			owner, err := j.ClaimOwner("account", event)
+			if owner != "" || (err != nil) != scenario.wantError {
+				t.Fatalf("directory availability changed ownership semantics: owner=%q err=%v", owner, err)
+			}
+			if scenario.wantError && j.Health().Reason != "claim_unavailable" {
+				t.Fatal("unavailable ownership evidence was not reported")
+			}
+		})
+	}
+}
+
+func TestUsageJournalMissingSegmentDirectorySpoolsAndRecovers(t *testing.T) {
+	j := testUsageJournal(t, true)
+	segments := j.path + ".segments"
+	saved := segments + ".saved"
+	if err := os.Rename(segments, saved); err != nil {
+		t.Fatal(err)
+	}
+	r := journalClosed(t, j, "account", "missing-segments", time.Now().Add(-time.Minute))
+	if err := j.Complete(r.ID, journalUsage(100, 90, 1, 10, "missing-segments-event"), "dashboard"); err != nil {
+		t.Fatal("WAL unavailability changed valid claim ownership", err)
+	}
+	if j.blocked || j.Health().Reason != "write_failed" || j.Health().SpoolRecords == 0 {
+		t.Fatal("recoverable WAL outage was quarantined", j.Health())
+	}
+	if err := os.Rename(saved, segments); err != nil {
+		t.Fatal(err)
+	}
+	if health := j.Flush(); health.State != "healthy" || health.SpoolRecords != 0 {
+		t.Fatal("restored WAL directory did not recover", health)
+	}
+}
+
 func TestUsageJournalRevisionsRemainProvisionalAndReplaceOneEvent(t *testing.T) {
 	j := testUsageJournal(t, true)
 	now := time.Now().UTC()
