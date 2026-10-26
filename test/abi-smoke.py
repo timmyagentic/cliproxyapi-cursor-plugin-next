@@ -104,14 +104,15 @@ try:
     assert registered["ok"] and registered["result"]["capabilities"]["executor"]
     assert registered["result"]["capabilities"]["quota_provider"]
     assert registered["result"]["capabilities"]["management_api"]
-    assert registered["result"]["metadata"]["Name"] == "Cursor"
+    assert registered["result"]["metadata"]["Name"] == "Cursor Next"
     assert registered["result"]["metadata"]["Logo"].endswith("/assets/cursor.png")
-    routes = call("management.register", {"BasePath": "/v0/management", "ResourceBasePath": "/v0/resource/plugins/spx-cursor"})["result"]
+    routes = call("management.register", {"BasePath": "/v0/management", "ResourceBasePath": "/v0/resource/plugins/cursor-next"})["result"]
     assert routes["routes"][0]["Method"] == "POST"
     page = call("management.handle", {"Method": "GET", "Path": routes["resources"][0]["Path"]})["result"]
     assert page["StatusCode"] == 200
     assert b'Cursor API Key' in base64.b64decode(page["Body"])
     assert registered["result"]["metadata"]["Version"] == json.loads((Path(__file__).resolve().parents[1] / "registry.json").read_text())["plugins"][0]["version"]
+    assert "magpie-community contributors" in call("plugin.license", {})["result"]["license"]
     assert call("quota.identifier", {})["result"]["identifier"] == "cursor"
     assert call("quota.describe", {})["result"]["supported_providers"] == ["cursor"]
     assert call("quota.reset", {})["error"]["http_status"] == 501

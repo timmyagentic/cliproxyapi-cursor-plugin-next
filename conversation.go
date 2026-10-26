@@ -112,19 +112,11 @@ func toolCatalog(tools []chatTool) string {
 	if len(tools) == 0 {
 		return ""
 	}
-	var out strings.Builder
-	out.WriteString("\n\n<dynamic_tool_catalog>\nThe MCP namespace \"magpie\" has the tools below. They are reached only through `CallDynamicTool`, never as tools of their own. Each entry is the exact call to make; its arguments must match the schema given. The schemas are complete, so there is no need to call `GetDynamicTools` first.\n")
-	for _, t := range tools {
-		out.WriteString("<call>CallDynamicTool({\"namespace\":\"magpie\",\"toolName\":")
-		out.Write(encodeJSON(t.Name))
-		out.WriteString(",\"arguments\":{...}})\n")
-		out.WriteString(t.Description)
-		out.WriteString("\narguments schema: ")
-		out.WriteString(t.SchemaText)
-		out.WriteString("\n</call>\n")
-	}
-	out.WriteString("</dynamic_tool_catalog>")
-	return out.String()
+	// RunAction and MCP configuration already carry each complete definition.
+	// Keep only the routing instruction here: copying descriptions and schemas
+	// into the system message both inflated the prompt and made its prefix depend
+	// on tool metadata. Caller-provided metadata stays in native tool definitions.
+	return "\n\n<dynamic_tool_catalog>\nThe available tools, descriptions, and complete argument schemas are provided in the native MCP tool definitions for namespace \"magpie\". Invoke only those tools through `CallDynamicTool({\"namespace\":\"magpie\",\"toolName\":\"<provided tool name>\",\"arguments\":{...}})`, using the exact provided name and schema. Do not guess tool names or treat them as tools outside this namespace.\n</dynamic_tool_catalog>"
 }
 func joinAssistantCalls(messages []map[string]any) []map[string]any {
 	out := []map[string]any{}

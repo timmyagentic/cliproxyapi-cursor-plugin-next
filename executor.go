@@ -19,16 +19,18 @@ type runEvent struct {
 	tool            map[string]any
 	stop            string
 	usage           map[string]any
+	accounting      map[string]any
+	internalCalls   int
 	err             error
 }
 type runState struct {
-	wrote, said, calls, answered, listed int
-	ended                                bool
-	usage                                map[string]any
-	tools                                []chatTool
-	blobs                                map[string][]byte
-	seen                                 map[string]string
-	estimate                             int
+	wrote, calls, answered, listed int
+	ended                          bool
+	usage                          map[string]any
+	tools                          []chatTool
+	blobs                          map[string][]byte
+	seen                           map[string]string
+	internalCalls                  int
 }
 
 var maxModeRequired = regexp.MustCompile(`(?i)max[ _]mode[ _]required|requires max mode`)
@@ -81,8 +83,11 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 	if err != nil {
 		return nil, err
 	}
-	cid := conversationID(chat, req)
-	events := p.run(s, token, resolution, conv, tools, cid)
+	account := usageAccount(req, token)
+	identity := req
+	identity.AuthID = account
+	cid := conversationID(chat, identity)
+	events := p.run(s, token, resolution, conv, tools, cid, account)
 	first, ok := <-events
 	if !ok {
 		return nil, failure(502, "Cursor returned an empty reply")
@@ -91,7 +96,7 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 		for range events {
 		}
 		resolution.Max = true
-		events = p.run(s, token, resolution, conv, tools, cid)
+		events = p.run(s, token, resolution, conv, tools, cid, account)
 		first, ok = <-events
 	}
 	if !ok {
@@ -103,18 +108,22 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 		return nil, first.err
 	}
 	responseHeaders := http.Header{"Content-Type": {"application/json"}, "X-Cursor-Continuity": {"stateless; bootstrap=imported-history; transport=CPA-host-HTTP"}}
+	responseHeaders.Set("X-Cursor-Usage-Policy", "measured-or-omitted; deferred=separate-journal")
 	id := "chatcmpl-" + strings.ReplaceAll(randomID(), "-", "")
 	created := p.now().Unix()
 	if stream {
 		responseHeaders.Set("Content-Type", "text/event-stream")
 		responseHeaders.Set("Cache-Control", "no-cache")
-		go streamReply(s, req.StreamID, events, first, id, model, created)
+		if err := p.startStreamWorker(func() { streamReply(s, req.StreamID, events, first, id, model, created) }); err != nil {
+			return nil, err
+		}
 		return map[string]any{"headers": responseHeaders}, nil
 	}
 	var content, reasoning strings.Builder
 	calls := []any{}
 	stop := "stop"
 	var usage map[string]any
+	var accounting map[string]any
 	apply := func(ev runEvent) error {
 		if ev.err != nil {
 			return ev.err
@@ -129,6 +138,7 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 		if ev.stop != "" {
 			stop = ev.stop
 			usage = ev.usage
+			accounting = ev.accounting
 		}
 		return nil
 	}
@@ -151,6 +161,9 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 	if usage != nil {
 		body["usage"] = usage
 	}
+	if accounting != nil {
+		body["cursor_usage"] = accounting
+	}
 	return map[string]any{"Payload": encodeJSON(body), "Headers": responseHeaders}, nil
 }
 func copyMap(m map[string]any) map[string]any {
@@ -167,19 +180,22 @@ func streamReply(s *requestScope, streamID string, events <-chan runEvent, first
 		if err != nil {
 			fields["error"] = err.Error()
 		}
-		_ = s.call("host.stream.close", fields, nil)
+		_ = s.streamCall("host.stream.close", fields, nil)
 	}
 	emit := func(value any) error {
-		return s.call("host.stream.emit", map[string]any{"stream_id": streamID, "payload": append(append([]byte("data: "), encodeJSON(value)...), []byte("\n\n")...)}, nil)
+		return s.streamCall("host.stream.emit", map[string]any{"stream_id": streamID, "payload": append(append([]byte("data: "), encodeJSON(value)...), []byte("\n\n")...)}, nil)
 	}
-	chunk := func(delta map[string]any, stop any, usage map[string]any) error {
+	chunk := func(delta map[string]any, stop any, usage, accounting map[string]any) error {
 		value := map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": stop}}}
 		if usage != nil {
 			value["usage"] = usage
 		}
+		if accounting != nil {
+			value["cursor_usage"] = accounting
+		}
 		return emit(value)
 	}
-	if err := chunk(map[string]any{"role": "assistant", "content": ""}, nil, nil); err != nil {
+	if err := chunk(map[string]any{"role": "assistant", "content": ""}, nil, nil, nil); err != nil {
 		closeStream(err)
 		return
 	}
@@ -189,13 +205,13 @@ func streamReply(s *requestScope, streamID string, events <-chan runEvent, first
 			_ = emit(map[string]any{"error": map[string]any{"message": ev.err.Error(), "code": errorStatus(ev.err)}})
 			return ev.err
 		case ev.text != "":
-			return chunk(map[string]any{"content": ev.text}, nil, nil)
+			return chunk(map[string]any{"content": ev.text}, nil, nil, nil)
 		case ev.reasoning != "":
-			return chunk(map[string]any{"reasoning_content": ev.reasoning}, nil, nil)
+			return chunk(map[string]any{"reasoning_content": ev.reasoning}, nil, nil, nil)
 		case ev.tool != nil:
-			return chunk(map[string]any{"tool_calls": []any{ev.tool}}, nil, nil)
+			return chunk(map[string]any{"tool_calls": []any{ev.tool}}, nil, nil, nil)
 		case ev.stop != "":
-			return chunk(map[string]any{}, ev.stop, ev.usage)
+			return chunk(map[string]any{}, ev.stop, ev.usage, ev.accounting)
 		}
 		return nil
 	}
@@ -209,25 +225,39 @@ func streamReply(s *requestScope, streamID string, events <-chan runEvent, first
 			return
 		}
 	}
-	err := s.call("host.stream.emit", map[string]any{"stream_id": streamID, "payload": []byte("data: [DONE]\n\n")}, nil)
+	err := s.streamCall("host.stream.emit", map[string]any{"stream_id": streamID, "payload": []byte("data: [DONE]\n\n")}, nil)
 	closeStream(err)
 }
 
-func (p *pluginRuntime) run(s *requestScope, token string, model modelResolution, conv chatConversation, tools []chatTool, cid string) <-chan runEvent {
+func (p *pluginRuntime) run(s *requestScope, token string, model modelResolution, conv chatConversation, tools []chatTool, cid, account string) <-chan runEvent {
 	events := make(chan runEvent, 1)
 	go func() {
 		defer close(events)
+		if err := p.acquireUsageRun(account, cid); err != nil {
+			events <- runEvent{err: err}
+			return
+		}
+		defer p.releaseUsageRun(account, cid)
 		ctx, cancel := context.WithCancel(s.ctx)
 		defer cancel()
 		emit := func(ev runEvent) bool {
 			select {
 			case events <- ev:
 				return true
-			case <-ctx.Done():
+			case <-s.ctx.Done():
 				return false
 			}
 		}
 		requestID := randomID()
+		started := p.now()
+		record, err := p.journal.Begin(account, cid, requestID, model.ID, started)
+		if err != nil {
+			emit(runEvent{err: failure(503, "Cursor usage journal is unavailable")})
+			return
+		}
+		defer func() {
+			_ = p.journal.Close(record.ID, p.now())
+		}()
 		h := headers(token)
 		h.Set("Content-Type", "application/connect+proto")
 		h.Set("Accept-Encoding", "identity")
@@ -330,8 +360,30 @@ func (p *pluginRuntime) run(s *requestScope, token string, model modelResolution
 			return
 		}
 		defer resp.Body.Close()
-		state := runState{tools: tools, blobs: blobs, seen: map[string]string{}, estimate: conv.Estimate}
-		err = state.decode(resp.Body, send, emit)
+		state := runState{tools: tools, blobs: blobs, seen: map[string]string{}}
+		var terminal runEvent
+		err = state.decode(resp.Body, send, func(ev runEvent) bool {
+			// Close the upstream Run before looking up its dashboard event.
+			// Tool/text deltas remain streamed; the final usage is never estimated.
+			if ev.stop != "" {
+				terminal = ev
+				return true
+			}
+			return emit(ev)
+		})
+		cancel()
+		_ = resp.Body.Close()
+		<-senderDone
+		ended := p.now()
+		if closeErr := p.journal.Close(record.ID, ended); closeErr != nil {
+			err = failure(503, "Cursor usage journal could not persist Run completion")
+		}
+		if err == nil && terminal.stop != "" {
+			terminal = p.accountUsage(s, token, account, record.ID, cid, model.ID, started, ended, terminal)
+			if s.ctx.Err() == nil {
+				emit(terminal)
+			}
+		}
 		if err != nil {
 			select {
 			case original := <-senderError:
@@ -350,21 +402,32 @@ func (p *pluginRuntime) run(s *requestScope, token string, model modelResolution
 }
 func (st *runState) finished() runEvent {
 	usage := st.usage
-	if usage == nil {
-		input := st.estimate
-		output := (st.said + 3) / 4
-		usage = map[string]any{"prompt_tokens": input, "completion_tokens": output, "total_tokens": input + output, "cursor_usage_estimated": true, "prompt_tokens_details": map[string]any{"cached_tokens": 0, "cache_write_tokens": 0}}
-	}
 	stop := "stop"
 	if st.calls > 0 {
 		stop = "tool_calls"
 	}
-	return runEvent{stop: stop, usage: usage}
+	return runEvent{stop: stop, usage: usage, internalCalls: st.internalCalls}
 }
 func usageFromFields(fs []pbField) map[string]any {
+	// An empty/malformed usage update is unknown, not an exact zero count.
+	measured := false
+	for _, f := range fs {
+		if f.number >= 1 && f.number <= 5 {
+			if f.wire != 0 || f.n > 1<<53-1 {
+				return nil
+			}
+			measured = true
+		}
+	}
+	if !measured {
+		return nil
+	}
 	input, output, read, write, reason := pbNum(fs, 1), pbNum(fs, 2), pbNum(fs, 3), pbNum(fs, 4), pbNum(fs, 5)
+	if read+write > input || input+output > 1<<53-1 || reason > output {
+		return nil
+	}
 	out := map[string]any{"prompt_tokens": input, "completion_tokens": output, "total_tokens": input + output, "prompt_tokens_details": map[string]any{"cached_tokens": read, "cache_write_tokens": write}}
-	if reason > 0 {
+	if pbGet(fs, 5) != nil {
 		out["completion_tokens_details"] = map[string]any{"reasoning_tokens": reason}
 	}
 	return out
@@ -412,14 +475,12 @@ func (st *runState) decode(reader io.Reader, send func([]byte) error, emit func(
 					switch update.number {
 					case 1:
 						text := pbText(fs, 1)
-						st.said += len(text)
 						st.wrote += len(text)
 						if text != "" && !emit(runEvent{text: text}) {
 							return context.Canceled
 						}
 					case 4:
 						text := pbText(fs, 1)
-						st.said += len(text)
 						if text != "" && !emit(runEvent{reasoning: text}) {
 							return context.Canceled
 						}
@@ -452,12 +513,12 @@ func (st *runState) decode(reader io.Reader, send func([]byte) error, emit func(
 				if call != nil {
 					call["index"] = st.calls
 					st.calls++
-					st.said += len(str(object(call["function"])["arguments"]))
 					if !emit(runEvent{tool: call}) {
 						return context.Canceled
 					}
 				} else if counted {
 					st.answered++
+					st.internalCalls++
 				}
 			case 4:
 				fs, err := pbFields(field.data)

@@ -47,7 +47,7 @@ func TestNativeToolDecodingAndAuthority(t *testing.T) {
 	for _, name := range []string{"read", "unknown"} {
 		for _, provider := range []string{"magpie", "foreign"} {
 			t.Run(name+"/"+provider, func(t *testing.T) {
-				state := runState{tools: []chatTool{{Name: "read", Schema: map[string]any{}}}, seen: map[string]string{}, estimate: 10}
+				state := runState{tools: []chatTool{{Name: "read", Schema: map[string]any{}}}, seen: map[string]string{}}
 				data := append(testToolFrame(name, provider, "magpie", wireBytes(3, []byte("a.txt"))), wireFrame(wireBytes(1, wireBytes(27, testUint(1, 1))), 0)...)
 				if name != "read" || provider != "magpie" {
 					data = append(data, syntheticReply()...)
@@ -65,8 +65,8 @@ func TestNativeToolDecodingAndAuthority(t *testing.T) {
 					if len(sent) != 0 {
 						t.Fatal("caller tool was executed or acknowledged before its result")
 					}
-					if events[1].usage["cursor_usage_estimated"] != true {
-						t.Fatal("missing estimate marker")
+					if events[1].usage != nil {
+						t.Fatal("a tool boundary without authoritative usage must remain unknown")
 					}
 				} else {
 					if len(sent) < 2 {

@@ -10,14 +10,15 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 )
 
-const version = "0.1.1"
-const pluginID = "spx-cursor"
-const pluginLogo = "https://raw.githubusercontent.com/spancerxing/cliproxyapi-cursor-plugin/main/assets/cursor.png"
+const version = "0.1.2"
+const pluginID = "cursor-next"
+const pluginLogo = "https://raw.githubusercontent.com/timmyagentic/cliproxyapi-cursor-plugin-next/main/assets/cursor.png"
 const cursorAPI = "https://api2.cursor.sh"
 const clientVersion = "cli-2026.09.23-86fc751"
 const maxWireBytes = 64 << 20
@@ -98,6 +99,7 @@ type rpcRequest struct {
 	Payload        []byte
 	CallbackID     string `json:"host_callback_id"`
 	StreamID       string `json:"stream_id"`
+	ConfigYAML     []byte `json:"config_yaml"`
 }
 
 func parseRequest(raw []byte, method string) (rpcRequest, error) {
@@ -136,13 +138,58 @@ type pluginRuntime struct {
 	models         map[string]modelCache
 	keys           map[string]keyCache
 	now            func() time.Time
+	usagePolicy    stepUsagePolicy
+	journal        *usageJournal
+	journalErr     error
+	usageActive    map[string]bool
+	usageRuns      sync.WaitGroup
+	streamWorkers  sync.WaitGroup
+	journalPath    string
+	reconcileNext  map[string]int
 }
 
 func newRuntime() *pluginRuntime {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &pluginRuntime{ctx: ctx, cancel: cancel, scopes: make(map[*requestScope]struct{}), logins: make(map[string]*loginFlow), models: make(map[string]modelCache), keys: make(map[string]keyCache), now: time.Now}
+	journal, err := newUsageJournal(os.Getenv("CURSOR_USAGE_JOURNAL"))
+	return &pluginRuntime{ctx: ctx, cancel: cancel, scopes: make(map[*requestScope]struct{}), logins: make(map[string]*loginFlow), models: make(map[string]modelCache), keys: make(map[string]keyCache), now: time.Now, usagePolicy: defaultStepUsagePolicy(), journal: journal, journalErr: err, journalPath: os.Getenv("CURSOR_USAGE_JOURNAL"), usageActive: make(map[string]bool)}
 }
-func (p *pluginRuntime) stop() { p.mu.Lock(); p.closed = true; p.mu.Unlock(); p.cancel() }
+func (p *pluginRuntime) stop() {
+	p.mu.Lock()
+	p.closed = true
+	p.mu.Unlock()
+	p.cancel()
+	// Scope shutdown waits for outstanding callbacks before releasing journal ownership.
+	p.mu.Lock()
+	scopes := make([]*requestScope, 0, len(p.scopes))
+	for s := range p.scopes {
+		scopes = append(scopes, s)
+	}
+	p.mu.Unlock()
+	for _, s := range scopes {
+		s.close()
+	}
+	p.usageRuns.Wait()
+	p.streamWorkers.Wait()
+	if p.journal != nil {
+		_ = p.journal.Shutdown()
+	}
+}
+
+// Admission and shutdown share p.mu: no worker can be added after stop starts
+// waiting. A stream worker closes its own scope, never waits for itself.
+func (p *pluginRuntime) startStreamWorker(work func()) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return failure(503, "Cursor plugin is shut down")
+	}
+	p.streamWorkers.Add(1)
+	go func() {
+		defer p.streamWorkers.Done()
+		work()
+	}()
+	return nil
+}
 
 func dispatch(p *pluginRuntime, method string, raw json.RawMessage, host hostCaller) (out []byte) {
 	defer func() {
@@ -169,7 +216,12 @@ func dispatch(p *pluginRuntime, method string, raw json.RawMessage, host hostCal
 	var value any
 	switch method {
 	case "plugin.register", "plugin.reconfigure":
-		value = registration()
+		err = p.configureAccounting(req.ConfigYAML)
+		if err == nil {
+			value = registration()
+		}
+	case "plugin.license":
+		value = map[string]any{"license": distributionLicense, "notice": distributionNotice, "third_party": map[string]string{"gopkg.in/yaml.v3": yamlLicense, "Apache-2.0": apacheLicense}}
 	case "executor.identifier", "auth.identifier", "quota.identifier":
 		value = map[string]any{"identifier": "cursor"}
 	case "plugin.quiesce":
@@ -225,7 +277,7 @@ func dispatch(p *pluginRuntime, method string, raw json.RawMessage, host hostCal
 	return resultEnvelope(value)
 }
 func registration() any {
-	return map[string]any{"schema_version": 1, "metadata": map[string]any{"Name": "Cursor", "Version": version, "Author": "spx", "GitHubRepository": "https://github.com/spancerxing/cliproxyapi-cursor-plugin", "Logo": pluginLogo, "ConfigFields": []any{}}, "capabilities": map[string]any{"management_api": true, "auth_provider": true, "model_provider": true, "quota_provider": true, "executor": true, "executor_model_scope": "oauth", "executor_input_formats": []string{"chat-completions"}, "executor_output_formats": []string{"chat-completions"}}}
+	return map[string]any{"schema_version": 1, "metadata": map[string]any{"Name": "Cursor Next", "Version": version, "Author": "timmyagentic; based on spx and magpie-community", "GitHubRepository": "https://github.com/timmyagentic/cliproxyapi-cursor-plugin-next", "Logo": pluginLogo, "ConfigFields": accountingConfigFields()}, "capabilities": map[string]any{"management_api": true, "auth_provider": true, "model_provider": true, "quota_provider": true, "executor": true, "executor_model_scope": "oauth", "executor_input_formats": []string{"chat-completions"}, "executor_output_formats": []string{"chat-completions"}}}
 }
 func randomID() string {
 	var b [16]byte

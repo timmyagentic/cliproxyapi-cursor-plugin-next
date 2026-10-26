@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/spancerxing/cliproxyapi-cursor-plugin",
+  "ref": "v0.1.1",
+  "commit": "ad798f3350eb92774cde939c2f2aa452f21b688e",
+  "license": "MIT",
+  "imported_paths": "Upstream repository tree; independently maintained changes follow the import commit.",
+  "reference_repository": "https://github.com/magpie-community/plugins",
+  "reference_package": "@magpie-community/opencode-cursor-auth",
+  "reference_version": "0.2.19"
+}

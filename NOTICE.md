@@ -1,5 +1,18 @@
 # Source and attribution
 
+This is an independently maintained successor to
+https://github.com/spancerxing/cliproxyapi-cursor-plugin, imported from tag
+`v0.1.1`, commit `ad798f3350eb92774cde939c2f2aa452f21b688e`.
+The original MIT license and upstream attributions below are preserved.
+Changes to accounting, tool-prompt construction, testing and documentation are
+maintained by the contributors to `timmyagentic/cliproxyapi-cursor-plugin-next`.
+This project is not an official Cursor or CLIProxyAPI product.
+
+The accounting configuration parser uses `gopkg.in/yaml.v3` v3.0.1, under its
+MIT and Apache-2.0 terms. Its notices and the Apache license are preserved in
+`third_party/` and embedded in the distributed library. See `plugin.license`
+for the binary's license/notice texts.
+
 The native implementation is based on the Cursor protocol, authentication,
 model selection, transcript and quota behavior in
 https://github.com/magpie-community/plugins/tree/main/packages/cursor,

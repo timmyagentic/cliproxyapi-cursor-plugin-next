@@ -1,108 +1,58 @@
-# CLIProxyAPI Cursor Plugin
+# CLIProxyAPI Cursor Plugin Next
 
-Connect Cursor to CLIProxyAPI with streaming, images, tool calls and quota reporting.
-Uses CPA's global proxy and request logging. Native Go plugin; no Node.js runtime required.
+Independently maintained Cursor provider for CPA, focused on tool-round usage accounting. Native Go C ABI plugin; no Node runtime is needed. Supports streaming Chat Completions, CPA Responses translation, images, caller tools, authentication and quota reporting.
 
-[中文说明](README_CN.md)
+Based on [spancerxing/cliproxyapi-cursor-plugin](https://github.com/spancerxing/cliproxyapi-cursor-plugin) **v0.1.1**, commit `ad798f3350eb92774cde939c2f2aa452f21b688e`. The original MIT license, magpie attribution and historical reference source are preserved. See [NOTICE.md](NOTICE.md) and [UPSTREAM.json](UPSTREAM.json). This is not an official Cursor or CPA product.
 
-## Store installation
+[中文](README_CN.md) · [Validation](VALIDATION.md) · [Accounting design](docs/accounting-design.md) · [Host compatibility](docs/host-compatibility.md) · [Install and rollback](docs/installation-and-rollback.md)
 
-After a Release is published, add this third-party source:
+## What changes
 
-```yaml
-plugins:
-  enabled: true
-  dir: /opt/cpa/plugins
-  store-sources:
-    - "https://raw.githubusercontent.com/spancerxing/cliproxyapi-cursor-plugin/main/registry.json"
-```
+- Tool rounds no longer report request/output bytes divided by four as exact tokens.
+- After closing a tool Run, query its Dashboard event through CPA's own HTTP callbacks. Match account, stable conversation, model, time window and event identity; require repeated stable samples before publishing a measurement.
+- Preserve cache-read, cache-write, uncached input and output semantics. Never add historical input to the current prompt size.
+- A Run with internal tool discovery can contain multiple model steps. Its cumulative Dashboard usage stays in the separate journal; it is not a current-context measurement.
+- Missing, ambiguous or unreadable usage is omitted, not replaced by fabricated zero/cache counts. Late measurements are recorded independently, including after restart when a private persistent journal is configured.
+- Remove the redundant system copy of full tool descriptions/schemas while retaining native MCP definitions and caller authority checks.
 
-Install **Cursor** in CPA's store. Release builds target Linux AMD64/ARM64,
-macOS AMD64/ARM64 and Windows AMD64; CPA selects its runtime platform, including the Linux container architecture
-for Docker. No build tools are needed at runtime. Mount a writable plugin directory for Docker.
-Once listed in the official registry, the third-party source is optional.
+## Important compatibility limits
 
-## Build from source
+CPA **8.0.38 and 8.0.43** preserve omitted usage in Responses, but their accounting recorder still makes a zero row with `quality=complete`. They also discard custom quality/deferred fields, omit cache-write detail in Responses, and provide no callback to correct an earlier usage row. The separate journal is therefore needed for an honest accounting audit; CPA's zero row is not evidence of zero upstream use.
 
-Requires Go 1.23+, a C compiler and Make. Build on the same OS and CPU architecture as CPA:
+Cursor Dashboard events have no verified final marker and can change after first publication. Repeated stable samples reduce the race but cannot prove permanent finality. Internal multi-step totals are withheld from context usage. This project does **not** claim perfect billing finality or complete context measurement for every tool round. See the exercised limits in [host compatibility](docs/host-compatibility.md).
 
-```sh
-git clone https://github.com/spancerxing/cliproxyapi-cursor-plugin.git
-cd cliproxyapi-cursor-plugin
-make build
-```
+## Build and test
 
-Output in `dist/`: `spx-cursor.so` on Linux, `spx-cursor.dll` on Windows, or `spx-cursor.dylib` on macOS.
-Windows builds require a matching MinGW toolchain.
-
-## Install in CPA
-
-CPA must support C ABI v1 plugins. Copy the library into the plugin directory and enable it in CPA's configuration:
-
-```yaml
-plugins:
-  enabled: true
-  dir: /opt/cpa/plugins
-  configs:
-    spx-cursor:
-      enabled: true
-      priority: 1
-```
-
-Set `dir` to the actual path, restart CPA and check its loading logs.
-For Docker, mount the plugin directory and use its container path.
-Manual installation requires the compiled library; CPA cannot load a source directory or a GitHub repository URL directly.
-
-## Sign in
-
-Choose Cursor login in CPA. If the UI has no entry, use CPA's v8 management API:
-
-```sh
-curl 'http://127.0.0.1:8317/v8/management/oauth/auth-url?provider=cursor' \
-  -H "Authorization: Bearer $CPA_MANAGEMENT_KEY"
-```
-
-Open the returned `url` to authorize, then poll with the returned `state` until `status` is `ok`:
-
-```sh
-curl "http://127.0.0.1:8317/v8/management/oauth/status?state=$STATE" \
-  -H "Authorization: Bearer $CPA_MANAGEMENT_KEY"
-```
-
-### API key login
-
-After installing the plugin, open **Cursor** in CPA's plugin resources menu.
-Enter the CPA management key, a Cursor API key and an optional account label,
-then choose **验证并保存** (validate and save). The plugin validates the key with
-Cursor before asking CPA to persist the account. Refresh the account and model
-lists afterward. The page does not store keys in browser storage. Browser login
-remains available through CPA's Cursor login entry.
-
-The default resource URL is `/v0/resource/plugins/spx-cursor/login`.
-Use the resource link in your management panel if CPA uses a different prefix.
-
-Alternatively, import a Cursor API key credential into CPA:
-
-```json
-{
-  "type": "cursor",
-  "cursor_auth": {"type": "api", "key": "YOUR_CURSOR_API_KEY"}
-}
-```
-
-## Use
-
-Get model IDs from CPA's `/v1/models` and select a `cursor/…` model in your client.
-Browser tokens require signing in again after expiry. Per-account proxy overrides are currently unsupported.
-
-## Development
+Requires Go 1.23+, a C compiler and Make. Build for the same OS/architecture as the host:
 
 ```sh
 make test
+make build
+python3 test/abi-smoke.py dist/cursor-next.dylib  # macOS; .so on Linux, .dll on Windows
 ```
 
-See [VALIDATION.md](VALIDATION.md) for verification scope and limitations.
-Real Cursor accounts and full CPA integration have not yet been tested.
-Based on the MIT-licensed [magpie Cursor plugin](https://github.com/magpie-community/plugins/tree/main/packages/cursor); see [NOTICE.md](NOTICE.md) for attribution.
+Outputs are in `dist/`. The binary embeds the MIT license and attribution, also available through the `plugin.license` ABI method. The historical Node reference is excluded from native builds.
 
-See [docs/publishing.md](docs/publishing.md) for releases and official store submission.
+Version **0.1.2** is a source/build candidate. The implementation does not automatically install, replace a running plugin, merge a PR or publish a release. Use an independent CPA process for validation; installation and rollback instructions are separate.
+
+## Configuration
+
+```yaml
+plugins:
+  enabled: true
+  dir: /absolute/path/to/plugins
+  configs:
+    cursor-next:
+      enabled: true
+      priority: 1
+      usage-journal: /absolute/private/cursor-next/usage.json
+      usage-wait-ms: 8000
+```
+
+The journal directory must be private (`0700` on Unix); journal and lock files are `0600`. On Windows, use an existing user-private ACL. `CURSOR_USAGE_JOURNAL` is an alternative to the config key; conflicting values are rejected. Empty journal configuration uses memory only and loses unresolved records on restart. A persistent file has exclusive process ownership, atomic updates and bounded retention; do not share it between CPA instances. Change an in-use path only after stopping its host.
+
+The provider remains `cursor`; existing Cursor credentials and `cursor/…` model IDs are reused. Load only one Cursor provider plugin in a host. The new library/plugin ID is `cursor-next`, so its artifact does not overwrite the upstream `spx-cursor` file.
+
+Current-request Dashboard lookup waits at most 8 seconds by default (configurable 3000–30000 ms). Cancellation ends the lookup. Later requests can reconcile unresolved observations, with at most four old records and a separate 2-second budget per request. No credentials or conversation text are stored in the journal. A final unresolved request may remain unknown until a later request; no background credential retention is used.
+
+For bounded real-provider and Codex probes, see [VALIDATION.md](VALIDATION.md). Public fixtures are synthetic; keep live credentials and evidence outside Git.

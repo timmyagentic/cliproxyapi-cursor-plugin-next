@@ -17,7 +17,7 @@ STORE = "router-for-me/CLIProxyAPI-Plugins-Store"
 
 
 def api(path, token, data=None, method=None):
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "spx-cursor-release",
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "cursor-next-release",
                "X-GitHub-Api-Version": "2022-11-28"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -69,15 +69,16 @@ Release assets (ZIP root contains `{plugin["id"]}.so`, `{plugin["id"]}.dylib` or
 ''' + "".join(f"\n- `{name}`" for name in names + ["checksums.txt"]) + '''
 
 Validation:
-- The maintainer has completed self-testing on their CPA deployment.
+- See the linked repository validation and compatibility documentation for tested behavior and limits.
 - The release workflow runs Go race tests, go vet and C ABI smoke tests on each target runner.
 - Release ZIP layouts, binary architectures and SHA256 checksums have been verified.
 
 Linux libraries target glibc 2.17 or newer. No Node.js runtime is required.
 Both login methods are provided by the plugin; no CPA source changes are required.
 
-Supersedes the closed PR #277 by adding the missing Darwin/macOS AMD64 and
-ARM64 binaries. The release covers all five required platform targets.
+This is an independently maintained MIT successor to spancerxing/cliproxyapi-cursor-plugin.
+The source and binary preserve upstream license and attribution.
+The release covers all five configured platform targets.
 This PR changes only `registry.json`.
 '''
     if not args.submit:
@@ -103,7 +104,7 @@ This PR changes only `registry.json`.
     assert set(entries) == set(names), "checksums must cover exactly the published platform ZIPs"
 
     user = api("/user", token)["login"]
-    branch = f'add-spx-cursor-v{plugin["version"]}-full-platform'
+    branch = f'add-cursor-next-v{plugin["version"]}-full-platform'
     existing = api(f"/repos/{STORE}/pulls?" + urlencode({"head": f"{user}:{branch}", "state": "open"}), token)
     if existing:
         print(existing[0]["html_url"])

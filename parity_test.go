@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -118,8 +119,29 @@ func TestReferenceConversationParity(t *testing.T) {
 				}
 				messages = append(messages, msg)
 			}
-			if conv.Last != c.Last || !reflect.DeepEqual(messages, c.Messages) {
-				t.Errorf("conversation differs\ngot: %s\nwant: %s", encodeJSON(messages), encodeJSON(c.Messages))
+			// Keep the upstream fixtures immutable. The intentional difference is
+			// the compact routing hint replacing the redundant system catalog;
+			// all user/developer text, images and history still match exactly.
+			want := append([]any(nil), c.Messages...)
+			tools := toolsOf(c.Chat)
+			if len(tools) > 0 {
+				legacy := legacyToolCatalog(tools)
+				found := false
+				for n, message := range want {
+					m := object(message)
+					if str(m["role"]) == "system" && strings.HasSuffix(str(m["content"]), legacy) {
+						m = copyMap(m)
+						m["content"] = strings.TrimSuffix(str(m["content"]), legacy) + toolCatalog(tools)
+						want[n] = m
+						found = true
+					}
+				}
+				if !found {
+					t.Fatal("upstream fixture no longer contains the exact legacy catalog")
+				}
+			}
+			if conv.Last != c.Last || !reflect.DeepEqual(messages, want) {
+				t.Errorf("conversation differs\ngot: %s\nwant: %s", encodeJSON(messages), encodeJSON(want))
 			}
 		})
 	}

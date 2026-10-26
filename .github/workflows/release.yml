@@ -67,7 +67,7 @@ jobs:
         run: |
           go test -race ./...
           go vet ./...
-          python -m unittest discover -s test -p test_release.py
+          python -m unittest discover -s test -p 'test_*.py'
       - name: Build Linux library (glibc 2.17 baseline)
         if: runner.os == 'Linux'
         env:
@@ -84,11 +84,11 @@ jobs:
           LIBRARY_EXT: ${{ matrix.ext }}
         run: |
           mkdir -p dist
-          go build -buildvcs=false -trimpath -buildmode=c-shared -o "dist/spx-cursor.$LIBRARY_EXT" .
+          go build -buildvcs=false -trimpath -buildmode=c-shared -o "dist/cursor-next.$LIBRARY_EXT" .
       - name: Verify C ABI on the target runner
         env:
           LIBRARY_EXT: ${{ matrix.ext }}
-        run: python test/abi-smoke.py "dist/spx-cursor.$LIBRARY_EXT"
+        run: python test/abi-smoke.py "dist/cursor-next.$LIBRARY_EXT"
       - name: Package
         env:
           TARGET_OS: ${{ matrix.goos }}
@@ -96,7 +96,7 @@ jobs:
           LIBRARY_EXT: ${{ matrix.ext }}
         run: |
           python scripts/release.py package --goos "$TARGET_OS" --goarch "$TARGET_ARCH" \
-            --library "dist/spx-cursor.$LIBRARY_EXT"
+            --library "dist/cursor-next.$LIBRARY_EXT"
       - uses: actions/upload-artifact@v6
         with:
           name: release-${{ matrix.goos }}-${{ matrix.goarch }}

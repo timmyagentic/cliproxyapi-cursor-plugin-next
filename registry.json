@@ -2,13 +2,13 @@
   "schema_version": 1,
   "plugins": [
     {
-      "id": "spx-cursor",
-      "name": "Cursor",
-      "description": "Cursor provider with browser and API key login, streaming Chat Completions, images, tool calls and quota reporting through CPA host HTTP callbacks.",
-      "author": "spx",
-      "version": "0.1.1",
-      "repository": "https://github.com/spancerxing/cliproxyapi-cursor-plugin",
-      "homepage": "https://github.com/spancerxing/cliproxyapi-cursor-plugin",
+      "id": "cursor-next",
+      "name": "Cursor Next",
+      "description": "Independently maintained Cursor provider with measured tool-step usage, separate deferred accounting, streaming, images, tools and quota support.",
+      "author": "timmyagentic",
+      "version": "0.1.2",
+      "repository": "https://github.com/timmyagentic/cliproxyapi-cursor-plugin-next",
+      "homepage": "https://github.com/timmyagentic/cliproxyapi-cursor-plugin-next",
       "license": "MIT",
       "tags": [
         "Provider",
@@ -18,7 +18,7 @@
         "Quota",
         "API Key"
       ],
-      "logo": "https://raw.githubusercontent.com/spancerxing/cliproxyapi-cursor-plugin/main/assets/cursor.png"
+      "logo": "https://raw.githubusercontent.com/timmyagentic/cliproxyapi-cursor-plugin-next/main/assets/cursor.png"
     }
   ]
 }

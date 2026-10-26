@@ -10,20 +10,22 @@ import (
 )
 
 type requestScope struct {
-	p          *pluginRuntime
-	ctx        context.Context
-	cancel     context.CancelFunc
-	host       hostCaller
-	callbackID string
-	mu         sync.Mutex
-	closed     bool
-	bodies     map[*hostBody]struct{}
-	pending    sync.WaitGroup
+	p               *pluginRuntime
+	ctx             context.Context
+	cancel          context.CancelFunc
+	host            hostCaller
+	callbackID      string
+	mu              sync.Mutex
+	closed          bool
+	bodies          map[*hostBody]struct{}
+	pending         sync.WaitGroup
+	streamCallbacks sync.WaitGroup
+	closeDone       chan struct{}
 }
 
 func (p *pluginRuntime) newScope(host hostCaller, id string) *requestScope {
 	ctx, cancel := context.WithCancel(p.ctx)
-	s := &requestScope{p: p, ctx: ctx, cancel: cancel, host: host, callbackID: id, bodies: make(map[*hostBody]struct{})}
+	s := &requestScope{p: p, ctx: ctx, cancel: cancel, host: host, callbackID: id, bodies: make(map[*hostBody]struct{}), closeDone: make(chan struct{})}
 	p.mu.Lock()
 	p.scopes[s] = struct{}{}
 	p.mu.Unlock()
@@ -66,10 +68,28 @@ func (s *requestScope) call(method string, fields map[string]any, result any) er
 	}
 	return nil
 }
+
+// Downstream callbacks must not outlive their request scope. HTTP cleanup uses
+// call directly because cancellation itself needs host.http.cancel/stream_close.
+// An already admitted stream callback may finish while close drains the scope;
+// close does not return until that callback has returned.
+func (s *requestScope) streamCall(method string, fields map[string]any, result any) error {
+	s.mu.Lock()
+	if s.closed || s.ctx.Err() != nil {
+		s.mu.Unlock()
+		return context.Canceled
+	}
+	s.streamCallbacks.Add(1)
+	s.mu.Unlock()
+	defer s.streamCallbacks.Done()
+	return s.call(method, fields, result)
+}
+
 func (s *requestScope) close() {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		<-s.closeDone
 		return
 	}
 	s.closed = true
@@ -83,9 +103,11 @@ func (s *requestScope) close() {
 		_ = b.Close()
 	}
 	s.pending.Wait()
+	s.streamCallbacks.Wait()
 	s.p.mu.Lock()
 	delete(s.p.scopes, s)
 	s.p.mu.Unlock()
+	close(s.closeDone)
 }
 
 type hostBody struct {
