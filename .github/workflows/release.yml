@@ -1,0 +1,139 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            image: quay.io/pypa/manylinux2014_x86_64
+            ext: so
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            image: quay.io/pypa/manylinux2014_aarch64
+            ext: so
+          - runner: windows-2022
+            goos: windows
+            goarch: amd64
+            ext: dll
+          - runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            ext: dylib
+          - runner: macos-15
+            goos: darwin
+            goarch: arm64
+            ext: dylib
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Configure Windows compiler
+        if: runner.os == 'Windows'
+        run: echo 'C:/msys64/mingw64/bin' >> "$GITHUB_PATH"
+      - name: Check version metadata
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python scripts/release.py metadata
+          if [[ "$REF_TYPE" == tag ]]; then
+            python scripts/release.py metadata --tag "$REF_NAME"
+          fi
+      - name: Test
+        run: |
+          go test -race ./...
+          go vet ./...
+          python -m unittest discover -s test -p test_release.py
+      - name: Build Linux library (glibc 2.17 baseline)
+        if: runner.os == 'Linux'
+        env:
+          BUILD_IMAGE: ${{ matrix.image }}
+        run: |
+          mkdir -p dist
+          docker run --rm \
+            -v "$PWD:/src" -v "$(go env GOROOT):/usr/local/go:ro" -w /src \
+            "$BUILD_IMAGE" /bin/bash scripts/build-linux.sh
+      - name: Build Windows or macOS library
+        if: runner.os != 'Linux'
+        env:
+          CGO_ENABLED: '1'
+          LIBRARY_EXT: ${{ matrix.ext }}
+        run: |
+          mkdir -p dist
+          go build -buildvcs=false -trimpath -buildmode=c-shared -o "dist/spx-cursor.$LIBRARY_EXT" .
+      - name: Verify C ABI on the target runner
+        env:
+          LIBRARY_EXT: ${{ matrix.ext }}
+        run: python test/abi-smoke.py "dist/spx-cursor.$LIBRARY_EXT"
+      - name: Package
+        env:
+          TARGET_OS: ${{ matrix.goos }}
+          TARGET_ARCH: ${{ matrix.goarch }}
+          LIBRARY_EXT: ${{ matrix.ext }}
+        run: |
+          python scripts/release.py package --goos "$TARGET_OS" --goarch "$TARGET_ARCH" \
+            --library "dist/spx-cursor.$LIBRARY_EXT"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/release/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: release-*
+          path: dist/release
+          merge-multiple: true
+      - name: Verify all packages and generate checksums
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python scripts/release.py checksums --tag "$RELEASE_TAG"
+          python scripts/release.py verify --tag "$RELEASE_TAG"
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/release/*.zip dist/release/checksums.txt --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/release/*.zip dist/release/checksums.txt \
+              --verify-tag --title "$RELEASE_TAG" --generate-notes
+          fi

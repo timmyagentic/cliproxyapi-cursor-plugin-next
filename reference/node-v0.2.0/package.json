@@ -1,0 +1,9 @@
+{
+  "name": "cliproxyapi-cursor-plugin",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "license": "MIT"
+}

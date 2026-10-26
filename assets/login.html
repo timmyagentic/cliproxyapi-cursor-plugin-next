@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cursor · API Key 登录</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { max-width: 440px; margin: 8vh auto; padding: 24px; line-height: 1.6; }
+  img { width: 64px; height: 64px; border-radius: 14px; }
+  h1 { margin-bottom: 4px; } p { color: #888; }
+  label { display: block; margin-top: 18px; }
+  input, button { box-sizing: border-box; width: 100%; padding: 12px; margin-top: 6px; font: inherit; border-radius: 8px; border: 1px solid #888; }
+  button { margin-top: 24px; cursor: pointer; } button:disabled { opacity: .6; }
+  #status { white-space: pre-wrap; }
+</style>
+<img src="{{.Logo}}" alt="Cursor">
+<h1>Cursor</h1>
+<p>使用 Cursor API Key 登录。浏览器授权仍可从 CPA 的 Cursor 登录入口进行。</p>
+<form id="login" data-endpoint="{{.Endpoint}}">
+  <label for="management-key">CPA 管理密钥</label>
+  <input id="management-key" type="password" required autocomplete="off">
+  <label for="api-key">Cursor API Key</label>
+  <input id="api-key" type="password" required autocomplete="off" spellcheck="false">
+  <label for="label">账号名称（可选）</label>
+  <input id="label" maxlength="200" placeholder="例如：个人账号">
+  <button id="submit" type="submit">验证并保存</button>
+</form>
+<p id="status" role="status" aria-live="polite"></p>
+<p>社区开发的 Cursor 接入插件。密钥只发送到当前 CPA 服务，页面不会将其保存在浏览器存储中。</p>
+<script>
+const form = document.getElementById('login');
+form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = document.getElementById('submit');
+  const status = document.getElementById('status');
+  button.disabled = true;
+  status.textContent = '正在验证并保存…';
+  try {
+    const response = await fetch(form.dataset.endpoint, {
+      method: 'POST', credentials: 'same-origin', cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + document.getElementById('management-key').value.trim() },
+      body: JSON.stringify({ api_key: document.getElementById('api-key').value.trim(), label: document.getElementById('label').value.trim() })
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      status.textContent = response.status === 401 ? '认证失败，请检查 CPA 管理密钥和 Cursor API Key。' : (result.error || '保存失败，请检查 CPA 日志。');
+      return;
+    }
+    form.reset();
+    status.textContent = '登录成功。返回 CPA 刷新账号和模型列表即可使用。';
+  } catch {
+    status.textContent = '请求失败，请检查 CPA 服务和网络后重试。';
+  } finally {
+    button.disabled = false;
+  }
+});
+</script>
+</html>

@@ -1,0 +1,32 @@
+--- a/vendor/cursor/index.mjs
++++ b/vendor/cursor/index.mjs
+@@ -29,6 +29,7 @@
+ // OpenCode speaks chat completions to it (@ai-sdk/openai-compatible); the
+ // fetch here answers them.
+ import { NATIVE_LIMITS, nativeSessions, NativeSessionError, nativeFields, nativeMcpArgs } from "./native-session.mjs"
++import { cursorFetch as fetch, currentTransport } from "../../transport.mjs"
+ import { isDeepStrictEqual } from "node:util"
+ import http2 from "node:http2"
+ import { STATUS_CODES } from "node:http"
+@@ -1768,6 +1769,7 @@
+ const cancelledOpen = () => ({ error: { status: 410, message: "the request was cancelled" }, h2Failed: false })
+ async function open(base, headers, signal) {
+   if (signal?.aborted) return cancelledOpen()
++  if (currentTransport()?.host) return openH1(headers, signal)
+   if (Date.now() >= h1Until) {
+     const o = await openH2(base, headers, signal)
+     // The head can arrive just before abort, before this continuation owns it.
+@@ -2628,7 +2630,12 @@
+   if (signal?.aborted) return errorResponse({ status: 410, message: "the request was cancelled" })
+   const tools = toolsOf(chat)
+   const convID = conversationID(chat, session)
+-  const prepared = nativeSessions.prepare(tok, chat, convID, tools)
++  // CPA HTTP operations belong to one host callback scope. Reconstruct
++  // caller-provided tool history rather than retaining a scoped transport
++  // after CPA has canceled it at the end of a request.
++  const prepared = currentTransport()?.host
++    ? { fallback: "CPA request-scoped HTTP transport" }
++    : nativeSessions.prepare(tok, chat, convID, tools)
+   let r
+   // the continuation's own prompt, which its final step reports (#156)
+   if (prepared.owner) r = prepared.owner.resume({ ...prepared, estimate: conversation(chat, tools).estimate }, signal)
