@@ -1,0 +1,6 @@
+/dist/
+/auths/
+*.log
+__pycache__/
+*.pyc
+/.local-tests/
