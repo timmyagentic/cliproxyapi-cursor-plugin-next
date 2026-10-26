@@ -342,7 +342,9 @@ func TestAccountingDispatchMultiToolMultiRoundMeasuredUsage(t *testing.T) {
 			t.Run(fmt.Sprintf("stream=%v/late-first=%v", stream, late), func(t *testing.T) {
 				t.Setenv("CURSOR_USAGE_JOURNAL", "")
 				p := newTestRuntime(t)
-				p.usagePolicy = stepUsagePolicy{Wait: 12 * time.Millisecond, First: 0, Interval: time.Millisecond, Ask: 5 * time.Millisecond, Skew: time.Millisecond, PageSize: 100, MaxPages: 2}
+				// This test exercises the full large-prompt protocol under -race,
+				// including Windows timer granularity; it is not a timeout test.
+				p.usagePolicy = stepUsagePolicy{Wait: 500 * time.Millisecond, First: 0, Interval: time.Millisecond, Ask: 100 * time.Millisecond, Skew: time.Millisecond, PageSize: 100, MaxPages: 2}
 				base := time.Now().Add(-time.Hour).Truncate(time.Second)
 				var stamp atomic.Int64
 				stamp.Store(base.UnixMilli())

@@ -79,13 +79,15 @@ func TestInternalToolStepsKeepRunTotalsOutOfContextUsage(t *testing.T) {
 
 func TestAccountingConfigurationAndEmbeddedAttribution(t *testing.T) {
 	t.Setenv("CURSOR_USAGE_JOURNAL", "")
+	// Register TempDir cleanup before runtime cleanup: Windows cannot remove
+	// the lock file until the owning runtime has closed its file handle.
+	path := filepath.Join(t.TempDir(), "private-journal", "usage.json")
 	p := newTestRuntime(t)
 	for _, raw := range []string{"usage-journal: relative.json", "usage-wait-ms: 500", "usage-wait-ms: 30001", "usage-journal: [invalid]"} {
 		if p.configureAccounting([]byte(raw)) == nil {
 			t.Fatal("invalid accounting config accepted")
 		}
 	}
-	path := filepath.Join(t.TempDir(), "private-journal", "usage.json")
 	if err := p.configureAccounting([]byte("usage-journal: " + path + "\nusage-wait-ms: 8000\n")); err != nil {
 		t.Fatal(err)
 	}
