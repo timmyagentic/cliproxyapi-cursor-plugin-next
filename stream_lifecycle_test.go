@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -28,7 +29,7 @@ func TestStreamShutdownDrainsBlockedFinalEmitBeforeReturning(t *testing.T) {
 			if err := json.Unmarshal(raw, &fields); err != nil {
 				return nil, err
 			}
-			if string(fields.Payload) == "data: [DONE]\n\n" {
+			if strings.Contains(string(fields.Payload), `"finish_reason":"stop"`) {
 				enteredOnce.Do(func() { close(entered) })
 				<-release
 			}

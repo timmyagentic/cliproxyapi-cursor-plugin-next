@@ -68,6 +68,7 @@ jobs:
           go test -race ./...
           go vet ./...
           python -m unittest discover -s test -p 'test_*.py'
+          python -m unittest discover -s integration -p 'test_native_sessions.py'
       - name: Build Linux library (glibc 2.17 baseline)
         if: runner.os == 'Linux'
         env:

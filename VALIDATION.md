@@ -1,6 +1,110 @@
 # Validation
 
-This document describes the independently maintained 0.1.3 candidate. The exact
+## Native 0.2.0 validation
+
+The native protocol/transport/runtime tests cover real local TLS HTTP/2 duplex,
+HTTP/HTTPS CONNECT and SOCKS proxies, connection reuse, pre-submission fallback,
+blocked writes and cancellation, malformed frames, proto3 default IDs, newer
+scalar updates, batched results, contract mismatch, exact replay, expiry,
+shutdown races and asynchronous accounting. `go test -race ./...`, `go vet ./...`
+and the real shared-library C ABI check passed locally on macOS arm64/Go 1.26.10.
+The workflow also runs the portable, credential-free A/B harness tests.
+
+A small real-provider comparison on 2026-10-27 kept **Grok 4.7, 500K, priority,
+medium reasoning**, the same credential, host/plugin binaries, outbound route,
+8-second accounting budget and zero automatic retries. Each case required four
+actual receipt-verified tools, a correct final answer and an ordinary follow-up
+(six HTTP requests). The Responses case exercised namespace and custom calls.
+
+| Small case | Native sessions | Host stateless |
+| --- | ---: | ---: |
+| Responses entire protocol | 23.49 s | 149.26 s |
+| Responses median first semantic output | 2.05 s | 13.46 s |
+| Chat entire protocol | 27.38 s | 116.27 s |
+| Chat median first semantic output | 1.51 s | 11.77 s |
+| Physical Run IDs in the journal, each case | 2 | 6 |
+
+These are single controlled synthetic samples, not a universal speed guarantee
+or decoder TPS measurement. Native retains one Run for four tool continuations
+and starts another for the ordinary follow-up. Standard native usage is omitted;
+Run measurements belong to the separate journal. The test host is an isolated
+CPA 8.0.43 source build with the proposed usage-presence, stream-unload and auth
+test patches; it is not the installed production service. Full tool-footprint
+and larger-history evidence must be assessed separately.
+
+`integration/native_sessions.py` runs `smoke`, `tools` (33 definitions / 442,107
+bytes) and `stress` (additional synthetic history) against already-started
+isolated listeners. `tools`/`stress` include a custom Lark grammar; validating the
+result packet proves compatibility, not provider-side constrained decoding.
+The default evidence root is `.local-tests/native` in the repository, overridable
+with `CURSOR_NATIVE_TEST_ROOT`. Reports retain timings, hashes and presence-aware
+measurement fields, never credentials or real user transcripts. `compare` checks
+the two arms' environment and workload before comparing them. Both native and
+stateless paths use the same candidate plugin, so this is a whole-path comparison
+of transport plus continuation plus accounting delivery, not a transport-only
+microbenchmark.
+
+The full fixture v2 also passed with 33 tools / 442,107 bytes and a custom Lark
+grammar accepting both JSON key orders. Native used `step,receipt`; host used
+`receipt,step`. The earlier key-order-restricted fixture's host failure remains
+a failed test and is not included in these comparisons.
+
+| Responses fixture v2 | Native sessions | Host stateless |
+| --- | ---: | ---: |
+| Full tools, six-request protocol | 32.99 s | 172.82 s |
+| Full tools, median first semantic output | 1.89 s | 14.55 s |
+| Full tools + 100,000 padding units, protocol | 40.12 s | 255.43 s |
+| Full tools + padding, median first semantic output | 1.86 s | 22.68 s |
+
+A native-only 260,000-padding case passed all six requests in 58.30 seconds.
+Its ordinary follow-up Run recorded 278,831 input tokens; the tool-chain Run
+recorded a cumulative 1,935,116 input tokens over six observed inference steps.
+The latter is **not** a single prompt's occupancy. This validates a larger
+history on the 500K route, not filling the entire window or automatic compaction.
+An independent later Cursor Dashboard snapshot matched all nine successful
+cases' event counts (native 2, host 6) and all available cache/output totals.
+Missing Dashboard counters remained unknown; event stability is not finality.
+
+An actual Codex 0.163.0 app-server test sent 42 tools / 446,003 tool-definition
+bytes per request, completed exactly three receipt-verified tools (including
+the parallel operand batch) and returned the correct final marker in three
+HTTP requests. Actual requests retained 500K, medium and priority; the copied
+catalog retained 500000 / 400000 context/compaction limits with no compaction.
+Stock installed CPA 8.0.43 separately passed the six-request native Responses
+functional test. Standard per-step usage remained absent in both tests.
+
+The installed `spx-cursor` v0.1.1 binary was also copied into an isolated stock
+CPA for a migration check. The candidate passed all six full-tool requests in
+34.11 seconds; v0.1.1 passed the four tools and final marker but its sixth,
+ordinary follow-up failed with 502 EOF. No retry was made. Core, credential,
+proxy and fixture identities matched, with different plugin binaries by design.
+This incomplete pair does **not** establish a full-run speedup against v0.1.1.
+
+`integration/transport_cooldown.py` additionally verifies the existing retry-hint
+ABI without provider calls. For both synchronous errors and `stream.close`,
+stock 8.0.43 returned 502/Retry-After:2, blocked an immediate request without
+executing it, and allowed one new execution after 2.25 seconds. Without the hint,
+the same paths still blocked after 2.25 seconds with about 58 seconds remaining.
+No global cooldown setting was changed. Native local-TLS tests verify that only
+classified network faults receive the hint, not HTTP auth/quota or protocol faults.
+
+After the transport-retry and parked-turn recovery fixes, the final local
+library passed the complete race/vet suites, 43 Python tests, C ABI loading and
+packaging. The actual Codex app-server probe passed again on installed stock
+8.0.43 with 42 tools, three verified tool calls and the original 500K/400K limits.
+One additional full-tool custom-grammar repeat failed at the fourth call because
+the model supplied a 62-byte string that was not valid JSON. The first three
+tools and native continuity had succeeded. That call was rejected without tool
+execution or argument repair, and the failed test is retained. Prompt-based
+grammar adaptation does not provide reliable constrained decoding; the earlier
+successful grammar cases must not be interpreted as a guarantee.
+
+For an actual Codex app-server tool probe, `integration/codex_probe.py` accepts
+`--model cursor/grok-4.7@500k --reasoning-effort medium --service-tier priority`.
+Select the existing 500K catalog entry; the helper preserves its context and
+compaction settings. It runs with a private test home and synthetic tools only.
+
+This document describes the independently maintained candidate. The exact
 v0.1.1 import remains in Git history and is identified in `UPSTREAM.json`.
 All checked-in fixtures and example counters are synthetic. Keep live-provider
 credentials, account identifiers, request logs and local evidence outside Git.

@@ -6,5 +6,12 @@
   "imported_paths": "Upstream repository tree; independently maintained changes follow the import commit.",
   "reference_repository": "https://github.com/magpie-community/plugins",
   "reference_package": "@magpie-community/opencode-cursor-auth",
-  "reference_version": "0.2.19"
+  "reference_version": "0.2.19",
+  "native_session_reference": {
+    "repository": "https://github.com/magpie-community/plugins",
+    "commit": "9c886c12f92d0da504b9c54cf2dd9df623a61617",
+    "version": "0.2.23",
+    "paths": ["packages/cursor/native-session.mjs", "packages/cursor/native-session.test.mjs", "packages/cursor/index.mjs"],
+    "license": "MIT"
+  }
 }

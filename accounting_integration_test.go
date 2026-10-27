@@ -271,12 +271,11 @@ func executeAccountingRound(t *testing.T, p *pluginRuntime, host *mockHost, stre
 	message := map[string]any{"role": "assistant", "content": ""}
 	body := map[string]any{}
 	var calls []any
-	stop, sawDone := "", false
+	stop := ""
 	for _, chunk := range chunks {
-		data := strings.TrimSpace(strings.TrimPrefix(string(chunk), "data: "))
-		if data == "[DONE]" {
-			sawDone = true
-			continue
+		data := strings.TrimSpace(string(chunk))
+		if strings.HasPrefix(data, "data:") || data == "[DONE]" {
+			t.Fatal("plugin must leave SSE framing and DONE to CPA")
 		}
 		value, err := jsonObject([]byte(data))
 		if err != nil || value["error"] != nil {
@@ -299,8 +298,8 @@ func executeAccountingRound(t *testing.T, p *pluginRuntime, host *mockHost, stre
 			}
 		}
 	}
-	if !sawDone || stop == "" {
-		t.Fatal("synthetic stream omitted its final stop or DONE marker")
+	if stop == "" {
+		t.Fatal("synthetic stream omitted its final stop marker")
 	}
 	if len(calls) > 0 {
 		message["tool_calls"] = calls

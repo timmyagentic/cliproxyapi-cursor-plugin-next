@@ -26,12 +26,18 @@ var apacheLicense string
 
 func accountingConfigFields() []any {
 	return []any{
+		map[string]any{"Name": "transport", "Type": "string", "Default": "auto", "Description": "auto uses native sessions when native-proxy-url is explicit; host keeps CPA HTTP; native requires explicit proxy configuration."},
+		map[string]any{"Name": "native-proxy-url", "Type": "string", "Default": "", "Description": "Explicit native Run proxy: direct, http://, https://, socks5:// or socks5h://. Empty retains CPA host transport. Match the host's approved route; never inferred."},
 		map[string]any{"Name": "usage-journal", "Type": "string", "Default": "", "Description": "Absolute JSON path in a private directory. Enables durable, separate usage reconciliation; empty uses memory only."},
 		map[string]any{"Name": "usage-wait-ms", "Type": "integer", "Default": 8000, "Description": "Bounded wait for the current Run's measured dashboard usage (3000–30000 ms). Missing usage is omitted, never estimated."},
 	}
 }
 
 func (p *pluginRuntime) configureAccounting(raw []byte) error {
+	native, err := parseNativeConfig(raw)
+	if err != nil {
+		return err
+	}
 	var cfg struct {
 		Journal string `yaml:"usage-journal"`
 		Wait    *int   `yaml:"usage-wait-ms"`
@@ -61,7 +67,10 @@ func (p *pluginRuntime) configureAccounting(raw []byte) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.usageActive) != 0 {
+	if p.closed {
+		return failure(503, "Cursor plugin is shut down")
+	}
+	if len(p.usageActive) != 0 || p.nativeRequests != 0 {
 		return failure(409, "Wait for active Cursor Runs before reconfiguring accounting")
 	}
 	if path != p.journalPath {
@@ -81,5 +90,5 @@ func (p *pluginRuntime) configureAccounting(raw []byte) error {
 		return failure(503, "Cursor usage journal is unavailable")
 	}
 	p.usagePolicy = policy
-	return nil
+	return p.configureNativeLocked(native)
 }
