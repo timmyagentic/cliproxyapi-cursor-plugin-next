@@ -893,3 +893,204 @@ func TestNativeCPAResponsesReasoningCombinerUsesKnownBlockSemantics(t *testing.T
 		t.Fatalf("block content was trimmed or normalized: %q", got)
 	}
 }
+
+func nativeSupersedeTestPool(t *testing.T) (*nativeSessions, func() []*nativeFakeTransport) {
+	t.Helper()
+	var mu sync.Mutex
+	transports := []*nativeFakeTransport{}
+	active := map[string]bool{}
+	ns := newNativeSessions(context.Background(), func(context.Context, string, string, string, []byte) (cursorRunTransport, error) {
+		tr := newNativeFakeTransport()
+		mu.Lock()
+		transports = append(transports, tr)
+		mu.Unlock()
+		return tr, nil
+	})
+	ns.OnStart = func(r nativeReceipt) error {
+		mu.Lock()
+		defer mu.Unlock()
+		key := r.Account + "\x00" + r.CID
+		if active[key] {
+			return failure(409, "synthetic CID already active")
+		}
+		active[key] = true
+		return nil
+	}
+	ns.OnEnd = func(r nativeReceipt, _ runEvent, _ error) {
+		mu.Lock()
+		delete(active, r.Account+"\x00"+r.CID)
+		mu.Unlock()
+	}
+	t.Cleanup(func() { _ = ns.Close() })
+	return ns, func() []*nativeFakeTransport {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]*nativeFakeTransport(nil), transports...)
+	}
+}
+
+func nativeReplacementTurn(t *testing.T, in nativeInput, pending []runEvent) nativeInput {
+	t.Helper()
+	next := nativeContinuation(t, in, pending)
+	// The explicit new user turn interrupts the unexecuted handoff. Keep the
+	// assistant calls but omit their results; conversation() represents them
+	// as interrupted imported history, rather than sending native results.
+	for len(next.Chat.Messages) > 0 && str(next.Chat.Messages[len(next.Chat.Messages)-1]["role"]) == "tool" {
+		next.Chat.Messages = next.Chat.Messages[:len(next.Chat.Messages)-1]
+	}
+	next.Chat.Messages = append(next.Chat.Messages, map[string]any{"role": "user", "content": "stop that handoff and handle this new turn"})
+	next.Conversation, _ = conversation(next.Chat, next.Tools)
+	return next
+}
+
+func TestNativeNewUserTurnSupersedesOnlyItsDeliveredParkedRun(t *testing.T) {
+	ns, snapshot := nativeSupersedeTestPool(t)
+	in := nativeTestInput()
+	in.OwnerScope = "same-owner"
+	events, old, err := ns.Start(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := snapshot()[0]
+	tr.push(nativeTestCall(1, "read"))
+	tr.push(nativeTestCount(1))
+	pending := nativeReadEvents(t, events)
+	old.Delivered()
+	next := nativeReplacementTurn(t, in, pending)
+	before := string(encodeJSON(next.Chat.Messages))
+	interrupted := false
+	for _, m := range next.Conversation.Messages {
+		if strings.Contains(string(m), missingToolResult) {
+			interrupted = true
+		}
+	}
+	if !interrupted {
+		t.Fatal("replacement history did not represent the interrupted tool")
+	}
+	baseEnd := ns.OnEnd
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	ns.OnEnd = func(r nativeReceipt, ev runEvent, e error) {
+		if r.RunID == old.RunID {
+			close(entered)
+			<-release
+		}
+		baseEnd(r, ev, e)
+	}
+	type startResult struct {
+		events  <-chan runEvent
+		receipt nativeReceipt
+		err     error
+	}
+	ready := make(chan startResult, 1)
+	go func() { ev, r, e := ns.Start(context.Background(), next); ready <- startResult{ev, r, e} }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("parked predecessor was not retired")
+	}
+	if len(snapshot()) != 1 || tr.closed.Load() != 1 {
+		t.Fatal("replacement opened before retiring the predecessor")
+	}
+	select {
+	case <-ready:
+		t.Fatal("replacement bypassed OnEnd/accounting ownership release")
+	case <-time.After(15 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(release) })
+	var result startResult
+	select {
+	case result = <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("new turn remained blocked after parked ownership release")
+	}
+	if result.err != nil || result.receipt.Resumed || result.receipt.RunID == old.RunID || len(snapshot()) != 2 {
+		t.Fatalf("new turn did not open a fresh Run: %+v", result)
+	}
+	if string(encodeJSON(next.Chat.Messages)) != before {
+		t.Fatal("supersede mutated caller history")
+	}
+	late := nativeContinuation(t, in, pending)
+	if _, _, err = ns.Start(context.Background(), late); err == nil || errorStatus(err) != 409 {
+		t.Fatalf("late results reused superseded execs: %v", err)
+	}
+	if len(tr.snapshot()) != 0 || len(snapshot()[1].snapshot()) != 0 {
+		t.Fatal("supersede submitted the abandoned native result")
+	}
+	snapshot()[1].push(nativeTestFinal("new user turn finished"))
+	done := nativeReadEvents(t, result.events)
+	result.receipt.Delivered()
+	if done[len(done)-1].err != nil {
+		t.Fatal("replacement Run failed")
+	}
+}
+
+func TestNativeNewUserSupersedeIsolationAndRetryBoundaries(t *testing.T) {
+	cases := []string{"initial request retry", "other account", "other CID", "other scope", "changed prefix", "running predecessor", "submitting predecessor", "undelivered handoff"}
+	for _, mode := range cases {
+		t.Run(mode, func(t *testing.T) {
+			ns, snapshot := nativeSupersedeTestPool(t)
+			in := nativeTestInput()
+			in.OwnerScope = "owner-one"
+			events, r, err := ns.Start(context.Background(), in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tr := snapshot()[0]
+			var pending []runEvent
+			if mode != "running predecessor" {
+				tr.push(nativeTestCall(1, "read"))
+				tr.push(nativeTestCount(1))
+				pending = nativeReadEvents(t, events)
+				if mode != "undelivered handoff" {
+					r.Delivered()
+				}
+			}
+			var next nativeInput
+			if mode == "running predecessor" {
+				next = in
+				var chat chatRequest
+				_ = json.Unmarshal(encodeJSON(in.Chat), &chat)
+				next.Chat = chat
+				next.Chat.Messages = append(next.Chat.Messages, map[string]any{"role": "user", "content": "new input while inference is running"})
+				next.Conversation, _ = conversation(next.Chat, next.Tools)
+			} else {
+				next = nativeReplacementTurn(t, in, pending)
+			}
+			switch mode {
+			case "initial request retry":
+				next = in
+			case "other account":
+				next.Account = "other-account"
+			case "other CID":
+				next.CID = "other-CID"
+			case "other scope":
+				next.OwnerScope = "owner-two"
+			case "changed prefix":
+				next.Chat.Messages[0]["content"] = "changed original instructions"
+				next.Conversation, _ = conversation(next.Chat, next.Tools)
+			case "submitting predecessor":
+				ns.mu.Lock()
+				owner := ns.entries[r.RunID]
+				ns.mu.Unlock()
+				owner.mu.Lock()
+				owner.state = "submitting"
+				owner.mu.Unlock()
+			}
+			_, _, err = ns.Start(context.Background(), next)
+			if tr.closed.Load() != 0 {
+				t.Fatalf("%s cancelled an unrelated/active predecessor", mode)
+			}
+			if mode == "other account" || mode == "other CID" {
+				if err != nil || len(snapshot()) != 2 {
+					t.Fatalf("separate identity should admit independently: %v", err)
+				}
+			} else {
+				if err == nil || errorStatus(err) != 409 || len(snapshot()) != 1 {
+					t.Fatalf("ambiguous/active ownership was bypassed: %v", err)
+				}
+			}
+		})
+	}
+}

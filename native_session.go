@@ -94,6 +94,7 @@ type nativeSession struct {
 	receipt                                                 nativeReceipt
 	limits                                                  nativeLimits
 	contract, identity                                      string
+	ownerScope                                              string
 	tools                                                   []chatTool
 	segment                                                 *nativeSegment
 	segments                                                []*nativeSegment
@@ -254,9 +255,13 @@ func (ns *nativeSessions) Start(ctx context.Context, in nativeInput) (<-chan run
 	if blobBytes > ns.limits.BlobBytes {
 		return nil, nativeReceipt{}, failure(413, "native bootstrap blob limit exceeded")
 	}
+	if err = ns.supersedeParked(ctx, in); err != nil {
+		return nil, nativeReceipt{}, err
+	}
 	now := time.Now()
 	runCtx, cancel := context.WithCancel(ns.ctx)
 	s := &nativeSession{pool: ns, ctx: runCtx, cancel: cancel, limits: ns.limits, contract: contract, identity: strings.ReplaceAll(randomID(), "-", ""), tools: nativeCloneTools(in.Tools), execs: map[uint64]*nativeCall{}, seenExecs: map[uint64]string{}, internalReplies: map[uint64][][]byte{}, nativeIDs: map[string]uint64{}, blobs: blobs, bootstrap: map[string]bool{}, blobBytes: blobBytes, state: "opening", started: now, expires: now.Add(ns.limits.Lifetime), workDone: make(chan struct{}), endDone: make(chan struct{}), internalSteps: 1, admissionDone: make(chan struct{})}
+	s.ownerScope = in.OwnerScope
 	s.receipt = nativeReceipt{RunID: randomID(), CID: in.CID, RequestID: randomID(), Account: in.Account, ModelID: in.Model.ID, Started: now, token: in.Token}
 	for k := range blobs {
 		s.bootstrap[k] = true
@@ -346,6 +351,69 @@ func (ns *nativeSessions) Start(ctx context.Context, in nativeInput) (<-chan run
 	}
 	ns.worker(s.watch)
 	return s.subscribe(ctx, seg, false), receipt, nil
+}
+
+// A new explicit user turn may replace one delivered, parked predecessor in
+// the exact same caller scope. It never submits results to the abandoned exec;
+// the new Run imports the caller's unchanged history through conversation().
+func (ns *nativeSessions) supersedeParked(ctx context.Context, in nativeInput) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if in.CID == "" || str(in.Chat.Messages[len(in.Chat.Messages)-1]["role"]) != "user" {
+		return nil
+	}
+	ns.mu.Lock()
+	owners := make([]*nativeSession, 0, len(ns.entries))
+	for _, s := range ns.entries {
+		if s.receipt.Account == in.Account && s.receipt.CID == in.CID && s.ownerScope == in.OwnerScope {
+			owners = append(owners, s)
+		}
+	}
+	ns.mu.Unlock()
+	var owner *nativeSession
+	var batch *nativeSegment
+	for _, s := range owners {
+		s.mu.Lock()
+		seg := s.segment
+		eligible := s.state == "parked" && seg.closed && seg.delivered && len(in.Chat.Messages) > seg.prefixLength
+		prefixLength, prefixDigest := seg.prefixLength, seg.prefixDigest
+		s.mu.Unlock()
+		if !eligible {
+			continue
+		}
+		actual, err := nativeHistoryDigest(in.Chat.Messages[:prefixLength])
+		if err != nil {
+			return err
+		}
+		if actual != prefixDigest {
+			continue
+		}
+		// Ambiguous ownership is not authority to cancel either Run.
+		if owner != nil {
+			return nil
+		}
+		owner, batch = s, seg
+	}
+	if owner == nil {
+		return nil
+	}
+	retired := owner.finishIf(failure(409, "native parked Run superseded by a new user turn"), runEvent{}, func() bool {
+		return ctx.Err() == nil && ns.ctx.Err() == nil && owner.state == "parked" && owner.segment == batch && batch.closed && batch.delivered
+	})
+	owner.mu.Lock()
+	ending := owner.state == "finishing" || owner.state == "failed" || owner.state == "complete"
+	owner.mu.Unlock()
+	if retired || ending {
+		select {
+		case <-owner.endDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ns.ctx.Done():
+			return failure(409, "native session store is closed")
+		}
+	}
+	return ctx.Err()
 }
 
 func (s *nativeSession) attach(ctx context.Context, seg *nativeSegment) {
@@ -529,11 +597,11 @@ func (s *nativeSession) resume(ctx context.Context, in nativeInput, contract str
 			r.call.submitted = true
 			s.mu.Unlock()
 			if err := s.send(protobuf(nil).bytes(2, msg)); err != nil {
-				s.finish(failure(errorStatus(err), "native result submission failed; outcome uncertain, cannot resubmit"), runEvent{})
+				s.finish(preserveRetryHint(err, failure(errorStatus(err), "native result submission failed; outcome uncertain, cannot resubmit")), runEvent{})
 				return
 			}
 			if err := s.send(nativeExecClose(r.call.RequestID)); err != nil {
-				s.finish(failure(errorStatus(err), "native result close failed; outcome uncertain, cannot resubmit"), runEvent{})
+				s.finish(preserveRetryHint(err, failure(errorStatus(err), "native result close failed; outcome uncertain, cannot resubmit")), runEvent{})
 				return
 			}
 		}

@@ -55,6 +55,7 @@ def main():
     ap.add_argument("--service-tier", choices=("auto", "priority"), help="Explicit isolated CPA payload policy; never changes the user's router")
     ap.add_argument("--timeout", type=int, default=360)
     args = ap.parse_args()
+    probe_deadline = time.monotonic() + args.timeout
     base = urllib.parse.urlsplit(args.base_url)
     if base.scheme != "http" or base.hostname not in ("127.0.0.1", "localhost"):
         ap.error("base-url must be an explicitly isolated loopback CPA instance")
@@ -81,7 +82,11 @@ def main():
             if self.path != "/v1/responses":
                 self.send_error(404)
                 return
-            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 16 * 1024 * 1024:
+                self.send_error(413, "bounded probe request size exceeded")
+                return
+            body = self.rfile.read(length)
             payload = json.loads(body)
             if args.service_tier:
                 payload["service_tier"] = args.service_tier
@@ -103,10 +108,14 @@ def main():
                 self.send_header("Content-Type", response.getheader("Content-Type", "text/event-stream"))
                 self.send_header("Connection", "close")
                 self.end_headers()
+                response_bytes = 0
                 while True:
-                    line = response.readline()
+                    line = response.readline(8 * 1024 * 1024 + 1)
                     if not line:
                         break
+                    response_bytes += len(line)
+                    if len(line) > 8 * 1024 * 1024 or response_bytes > 16 * 1024 * 1024:
+                        raise ValueError("bounded probe response size exceeded")
                     if line.startswith(b"data:"):
                         try:
                             value = json.loads(line[5:])
@@ -174,7 +183,7 @@ stream_max_retries = 0
         process.stdin.flush()
 
     def receive_until(predicate):
-        deadline = time.monotonic()+args.timeout
+        deadline = probe_deadline
         while time.monotonic() < deadline:
             event = incoming.get(timeout=max(.1, deadline-time.monotonic()))
             if event.get("probe_eof"):
@@ -201,6 +210,8 @@ stream_max_retries = 0
                 events.append({"method": method, "tokenUsage": params["tokenUsage"]})
             elif method in ("item/started", "item/completed"):
                 item = params.get("item", {})
+                if item.get("type") not in ("userMessage", "agentMessage", "reasoning", "dynamicToolCall", "contextCompaction"):
+                    raise RuntimeError("unexpected non-fixture item type")
                 if item.get("type") in ("contextCompaction", "agentMessage", "commandExecution", "dynamicToolCall"):
                     events.append({"method": method, "item": {k: item[k] for k in ("type", "text", "status", "tool") if k in item}})
             elif method == "turn/completed":
@@ -234,7 +245,7 @@ stream_max_retries = 0
         result["verified_marker"] = any(text.strip() == marker for text in texts)
         result["compactions"] = sum(e.get("method") == "item/completed" and e.get("item", {}).get("type") == "contextCompaction" for e in events)
         result["tools"] = calls
-        result["passed"] = result["completed"] and result["verified_marker"] and result["compactions"] == 0 and len(calls) >= 3 and all(c["success"] for c in calls)
+        result["passed"] = result["completed"] and result["verified_marker"] and result["compactions"] == 0 and len(calls) == 3 and {c["tool"] for c in calls} == {"probe_left", "probe_right", "probe_difference"} and all(c["success"] for c in calls)
     except Exception as exc:
         result.update(passed=False, error_type=type(exc).__name__)
     finally:

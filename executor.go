@@ -231,7 +231,7 @@ func streamReply(s *requestScope, streamID string, events <-chan runEvent, first
 		fields := map[string]any{"stream_id": streamID}
 		if err != nil {
 			fields["error"] = err.Error()
-			fields["error_detail"] = &rpcError{Code: "cursor_error", Message: err.Error(), HTTPStatus: errorStatus(err)}
+			fields["error_detail"] = pluginErrorDetail(err)
 		}
 		_ = s.streamCall("host.stream.close", fields, nil)
 	}

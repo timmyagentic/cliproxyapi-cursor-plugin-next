@@ -25,9 +25,10 @@ const maxWireBytes = 64 << 20
 
 type hostCaller func(string, []byte) ([]byte, error)
 type rpcError struct {
-	Code       string `json:"code"`
-	Message    string `json:"message"`
-	HTTPStatus int    `json:"http_status,omitempty"`
+	Code              string `json:"code"`
+	Message           string `json:"message"`
+	HTTPStatus        int    `json:"http_status,omitempty"`
+	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
 }
 type message struct {
 	Result json.RawMessage
@@ -72,7 +73,11 @@ func resultEnvelope(value any) []byte {
 	return envelope(message{Result: raw})
 }
 func errorEnvelope(err error) []byte {
-	return envelope(message{Error: &rpcError{Code: "cursor_error", Message: err.Error(), HTTPStatus: errorStatus(err)}})
+	return envelope(message{Error: pluginErrorDetail(err)})
+}
+
+func pluginErrorDetail(err error) *rpcError {
+	return &rpcError{Code: "cursor_error", Message: err.Error(), HTTPStatus: errorStatus(err), RetryAfterSeconds: retryAfterSeconds(err)}
 }
 
 type rpcRequest struct {

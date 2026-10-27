@@ -35,8 +35,8 @@ const nativeHandshakeWait = 15 * time.Second
 const nativeWriteWait = 30 * time.Second
 
 var errNativeNoH2ALPN = errors.New("Cursor native HTTP/2 ALPN unavailable before request submission")
-var errNativeHeadTimeout = &statusError{504, "Native Cursor response header deadline exceeded"}
-var errNativeWriteTimeout = &statusError{504, "Native Cursor write deadline exceeded; outcome uncertain, cannot resubmit"}
+var errNativeHeadTimeout = transportFailure(504, "Native Cursor response header deadline exceeded")
+var errNativeWriteTimeout = transportFailure(504, "Native Cursor write deadline exceeded; outcome uncertain, cannot resubmit")
 
 // The pool contains clients, never request headers or host callbacks. Endpoint
 // and trust injection are package-local test seams, not operator TLS bypasses.
@@ -240,9 +240,12 @@ type nativeWireRun struct {
 	writeWait time.Duration
 }
 
-func nativeSafeError(ctx context.Context, phase string) error {
+func nativeSafeError(ctx context.Context, phase string, cause ...error) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if len(cause) > 0 && nativeNetworkFailure(cause[0]) {
+		return transportFailure(502, "Native Cursor "+phase+" failed")
 	}
 	return failure(502, "Native Cursor %s failed", phase)
 }
@@ -294,7 +297,7 @@ func (p *nativeTransportPool) open(ctx context.Context, entry *nativeTransportEn
 			req.Header.Set("Content-Type", "application/proto")
 			resp, err := client.Do(req)
 			if err != nil {
-				return nativeSafeError(runCtx, "append")
+				return nativeSafeError(runCtx, "append", err)
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -302,7 +305,7 @@ func (p *nativeTransportPool) open(ctx context.Context, entry *nativeTransportEn
 			}
 			n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, maxWireBytes+1))
 			if err != nil || n > maxWireBytes {
-				return nativeSafeError(runCtx, "append response")
+				return nativeSafeError(runCtx, "append response", err)
 			}
 			return nil
 		}
@@ -335,7 +338,7 @@ func (p *nativeTransportPool) open(ctx context.Context, entry *nativeTransportEn
 		defer headTimer.Stop()
 		resp, e := client.Do(req)
 		if e != nil {
-			t.shutdown(nativeSafeError(ctx, "open"))
+			t.shutdown(nativeSafeError(ctx, "open", e))
 		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			t.shutdown(nativeHTTPError(resp.StatusCode))
 			resp.Body.Close()
@@ -455,7 +458,7 @@ func (t *nativeWireRun) writer() {
 				// account selection does not mistake them for transport failures.
 				var status *statusError
 				if !errors.As(err, &status) {
-					err = nativeSafeError(t.ctx, "write")
+					err = nativeSafeError(t.ctx, "write", err)
 				}
 				t.shutdown(err)
 			}
@@ -512,7 +515,7 @@ func (t *nativeWireRun) Next(ctx context.Context) ([]byte, bool, error) {
 	if closed || body == nil {
 		return nil, false, t.failure()
 	}
-	data, end, err := readConnectFrame(body)
+	data, end, err := readConnectFrame(nativeNetworkReader{body})
 	if ctx.Err() != nil {
 		t.shutdown(ctx.Err())
 		return nil, false, ctx.Err()
@@ -521,7 +524,14 @@ func (t *nativeWireRun) Next(ctx context.Context) ([]byte, bool, error) {
 		return nil, false, t.failure()
 	}
 	if err != nil {
-		err = nativeSafeError(ctx, "stream read")
+		// Only the underlying response-body read is a network failure;
+		// Connect/gzip decoding failures retain the normal host policy.
+		var read nativeReadError
+		if errors.As(err, &read) {
+			err = nativeSafeError(ctx, "stream read", err)
+		} else {
+			err = nativeSafeError(ctx, "stream read")
+		}
 		t.shutdown(err)
 		return nil, false, err
 	}
@@ -635,7 +645,7 @@ func (p *nativeTransportPool) JSON(ctx context.Context, account, token, path str
 	req.GetBody = nil
 	resp, err := entry.h1.Do(req)
 	if err != nil {
-		return nil, nativeSafeError(ctx, "JSON query")
+		return nil, nativeSafeError(ctx, "JSON query", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -643,7 +653,7 @@ func (p *nativeTransportPool) JSON(ctx context.Context, account, token, path str
 	}
 	raw, err = io.ReadAll(io.LimitReader(resp.Body, maxWireBytes+1))
 	if err != nil || len(raw) > maxWireBytes {
-		return nil, nativeSafeError(ctx, "JSON response")
+		return nil, nativeSafeError(ctx, "JSON response", err)
 	}
 	var result map[string]any
 	if json.Unmarshal(raw, &result) != nil || result == nil {

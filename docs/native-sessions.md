@@ -80,11 +80,26 @@ Real thinking resets the quiet timer; parking pauses it. Transport open/write
 and proxy handshakes are separately bounded at 15 seconds for connection and
 response-head establishment; queued writes have a 30-second bound.
 
+Locally identified network failures retain HTTP 502/504 and carry the existing
+CPA ABI's two-second retry hint. On stock 8.0.43 this replaces its otherwise
+minute-long cooldown for that transport fault. Actual upstream HTTP/Connect
+errors (including authentication and quota), protocol errors, certificate
+verification failures and caller cancellation do not acquire this hint. It
+does not replay a write or change global cooldown configuration; older hosts
+may ignore the optional ABI field.
+
 Expired owners, restart, changed history/compaction and uncertain submissions
 return explicit 409 rather than silently sending results to another native exec.
 A new user turn with complete history starts a fresh Run. Retention is for tool
 continuations within a turn; it does not eliminate all future history imports.
 Checkpoints and blobs help the live Run only; they are not restart handles.
+
+A new explicit user message can retire a delivered parked predecessor only
+when account, conversation, caller scope and the complete old history prefix
+match. Its completion hook releases ownership before the new Run opens. Initial
+request retries, unrelated histories and currently running/submitting owners do
+not trigger replacement. Late results for the retired handles fail instead of
+being sent to another execution.
 
 ## Accounting and context
 
