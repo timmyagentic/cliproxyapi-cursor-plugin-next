@@ -184,6 +184,84 @@ func nativePark(t *testing.T, ns *nativeSessions, tr *nativeFakeTransport, in na
 	return nativeContinuation(t, in, out), r, out
 }
 
+func TestNativeTimingExcludesParkedToolsAndReplayedResponses(t *testing.T) {
+	ns, tr, opens := nativeTestPool(t)
+	ended := make(chan nativeReceipt, 1)
+	ns.OnEnd = func(r nativeReceipt, _ runEvent, _ error) { ended <- r }
+	in := nativeTestInput()
+	in.RequestedModel = "grok-4.7-fast"
+	next, receipt, _ := nativePark(t, ns, tr, in, 1)
+	ns.mu.Lock()
+	session := ns.entries[receipt.RunID]
+	ns.mu.Unlock()
+	session.mu.Lock()
+	if !session.activeSince.IsZero() || session.firstOutput == nil {
+		t.Fatal("tool handoff must stop active timing after meaningful output")
+	}
+	// A long tool execution interval is represented without sleeping. Only
+	// explicitly active intervals may contribute to the final Run duration.
+	session.activeElapsed = 2 * time.Second
+	session.started = time.Now().Add(-time.Hour)
+	session.mu.Unlock()
+	events, resumed, err := ns.Start(context.Background(), next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	active := !session.activeSince.IsZero()
+	session.mu.Unlock()
+	if !active {
+		t.Fatal("reserved results did not restart active inference timing")
+	}
+	tr.push(nativeTestFinal("synthetic timed completion"))
+	nativeReadEvents(t, events)
+	resumed.Delivered()
+	final := <-ended
+	if final.RequestedModel != in.RequestedModel || final.ActiveMilliseconds < 2000 || final.ActiveMilliseconds >= 60000 || final.FirstOutputMilliseconds == nil {
+		t.Fatalf("incorrect final timing or alias: %+v", final)
+	}
+	replayed, replayReceipt, err := ns.Start(context.Background(), next)
+	if err != nil || !replayReceipt.Replay {
+		t.Fatalf("expected completed replay: %+v %v", replayReceipt, err)
+	}
+	nativeReadEvents(t, replayed)
+	replayReceipt.Delivered()
+	select {
+	case <-ended:
+		t.Fatal("response replay created another timed Run")
+	default:
+	}
+	if opens.Load() != 1 {
+		t.Fatal("timing or replay created another transport")
+	}
+}
+
+func TestNativeFirstOutputIgnoresNonOutputEvents(t *testing.T) {
+	session := &nativeSession{started: time.Now().Add(-time.Second), limits: defaultNativeLimits(), segment: &nativeSegment{notify: make(chan struct{})}}
+	if err := session.emitLocked(runEvent{}); err != nil || session.firstOutput != nil {
+		t.Fatal("empty protocol event became first output")
+	}
+	if err := session.emitLocked(runEvent{reasoning: "synthetic thought"}); err != nil || session.firstOutput == nil {
+		t.Fatal("reasoning was not recognized as client-visible output")
+	}
+	first := *session.firstOutput
+	if err := session.emitLocked(runEvent{text: "synthetic answer"}); err != nil || *session.firstOutput != first {
+		t.Fatal("later output replaced Run first-output timing")
+	}
+}
+
+func TestNativeActiveTimingUsesOnlyExplicitMonotonicIntervals(t *testing.T) {
+	start := time.Now()
+	session := &nativeSession{activeSince: start}
+	session.pauseActiveLocked(start.Add(2 * time.Second))
+	session.pauseActiveLocked(start.Add(10 * time.Second))
+	session.activeSince = start.Add(20 * time.Second)
+	session.pauseActiveLocked(start.Add(23 * time.Second))
+	if session.activeElapsed != 5*time.Second || !session.activeSince.IsZero() {
+		t.Fatal("parked time was included in active duration")
+	}
+}
+
 func TestNativeSameRunParallelResultsAndMeasuredEndHook(t *testing.T) {
 	ns, tr, opens := nativeTestPool(t)
 	var starts, ends atomic.Int32

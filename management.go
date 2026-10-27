@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"html/template"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -51,13 +52,40 @@ func (p *pluginRuntime) handleManagement(s *requestScope, req rpcRequest) (any, 
 	}
 	endpoint := base + "/plugins/" + pluginID + "/api-key"
 	if req.Method == http.MethodGet && req.Path == base+"/plugins/"+pluginID+"/accounting" {
-		// This authenticated management route exposes only health counters, not
-		// credentials, journal paths, event identities, or conversation contents.
+		// CPA authenticates this route. The bounded feed contains opaque Run
+		// keys and measurements, never credentials or conversation contents.
+		after, limit := uint64(0), maxAccountingPage
+		if values, ok := req.Query["after_sequence"]; ok {
+			if len(values) != 1 {
+				return managementResponse(400, "application/json", encodeJSON(map[string]any{"error": "invalid accounting cursor"})), nil
+			}
+			var err error
+			after, err = strconv.ParseUint(values[0], 10, 53)
+			if err != nil {
+				return managementResponse(400, "application/json", encodeJSON(map[string]any{"error": "invalid accounting cursor"})), nil
+			}
+		}
+		if values, ok := req.Query["limit"]; ok {
+			if len(values) != 1 {
+				return managementResponse(400, "application/json", encodeJSON(map[string]any{"error": "invalid accounting limit"})), nil
+			}
+			var err error
+			limit, err = strconv.Atoi(values[0])
+			if err != nil || limit < 1 || limit > maxAccountingPage {
+				return managementResponse(400, "application/json", encodeJSON(map[string]any{"error": "invalid accounting limit"})), nil
+			}
+		}
 		p.mu.Lock()
-		health := p.journal.Health()
+		journal := p.journal
 		active := len(p.usageActive)
 		p.mu.Unlock()
-		return managementResponse(200, "application/json", encodeJSON(map[string]any{"journal": health, "active_runs": active, "version": version})), nil
+		page, err := journal.AccountingChanges(after, limit)
+		if err != nil {
+			return managementResponse(503, "application/json", encodeJSON(map[string]any{"error": "accounting page unavailable", "journal": journal.Health()})), nil
+		}
+		out, _ := jsonObject(encodeJSON(page))
+		out["journal"], out["active_runs"], out["version"] = journal.Health(), active, version
+		return managementResponse(200, "application/json", encodeJSON(out)), nil
 	}
 	if req.Method == http.MethodGet && req.Path == resource+"/login" {
 		var body bytes.Buffer

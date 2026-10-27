@@ -122,3 +122,60 @@ Native Chat replies expose `cursor_usage` (state, Run ID, replay/continuation an
 transport). CPA Responses can discard custom fields. Use the separate journal
 and returned call handles for continuity evidence. The plugin emits raw JSON
 chunks; CPA alone supplies SSE `data:` framing and `[DONE]`.
+
+## Revisioned desktop accounting (0.2.1)
+
+Every native terminal reply also carries a small `usage_accounting` reference:
+`provider`, `scope=run`, opaque `record_id`, `state`, `resumed` and `replay`.
+A supporting CPA host preserves that reference through Responses translation
+and its usage queue without inventing request token measurements. The desktop
+collector uses it to join HTTP requests to an independent Run ledger. One Run
+contributes its latest observed counters once, regardless of its number of tool
+requests, retries, query refreshes or pages. Later observations replace the
+previous value, including downward revisions.
+
+The authenticated plugin `accounting` management route accepts
+`after_sequence` (default 0) and `limit` (1–100). It returns schema version 1,
+the journal high-water `sequence`, `next_sequence`, `has_more` and `records`.
+Consumers probe the stable `instance_id` with `after_sequence=0&limit=1`,
+then persist a cursor per host/port/instance transactionally with
+ID/sequence-based upserts. A fresh journal has a new identity even when its
+sequence is greater than the previous journal's cursor.
+The feed reads the append archive as well as current memory; restarting a Run
+publishes a new interrupted-state revision for existing consumers. The host's
+current `/v8/management` entry maps to the existing plugin route; older hosts
+provide it under `/v0/management` only.
+
+Public records contain Run start/end time, requested and upstream model,
+measurement source, status, provisional/stable flags, nullable usage and local
+timing. They contain no credentials, account/CID/event identities, prompts,
+tool arguments or journal paths. A Dashboard field absent from its JSON stays
+unknown. `reported_input_tokens` and `reported_total_tokens` are sums of the
+explicitly reported components; they are labelled as reported amounts when the
+complete input composition is unavailable. They never become standard context
+usage. Sampling stability does not establish immutable billing finality.
+
+Active Runs receive a bounded background Dashboard snapshot every ten seconds.
+Its provisional counters remain separate from terminal reconciliation. Closing
+the Run cancels and drains that observer before recording final data. Local
+active-inference time excludes parked client tool execution and response replay;
+output divided by that duration is a Run effective rate, not decoder TPS.
+
+## Optional client context estimates
+
+`client-context-estimate: true` explicitly requests a supporting host's local
+tokenizer estimate for Responses clients that otherwise cannot auto-compact
+without standard usage. It is disabled by default. The host counts the current
+complete prompt and the current reply, preserves the real accounting snapshot
+before adding client-facing estimates, and marks `response.context_usage` as
+`estimated` with its actual tokenizer encoding and `scope=request_context`.
+Known upstream request usage is never replaced.
+
+The local tokenizer is an approximation for Grok and cannot observe Cursor's
+hidden prompt. Codex 0.163 uses these estimated standard counters for its own
+context display and token budgets as well as auto-compaction; it ignores the
+extra provenance field. This opt-in compatibility mode must therefore be
+disclosed to callers. Desktop billing, cache measurements and Run rates continue
+to use the independent measured ledger. Preserve the configured context window
+and compaction threshold; do not treat successful compaction as proof that the
+estimate equals the provider's exact occupancy.

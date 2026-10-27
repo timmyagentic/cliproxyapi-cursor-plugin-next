@@ -263,6 +263,7 @@ func (s *nativeSession) sealLocked() error {
 		s.internalSteps++
 		return nil
 	}
+	s.pauseActiveLocked(time.Now())
 	s.state = "parked"
 	s.heard = 0
 	// Register before exposing the handoff. Pool operations never hold their

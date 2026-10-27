@@ -92,6 +92,12 @@ func publicUsage(usage map[string]any) map[string]any {
 		return nil
 	}
 	result := copyMap(usage)
+	if observed := object(result["cursor_usage_presence"]); observed != nil {
+		if observed["prompt_tokens"] != true || observed["completion_tokens"] != true {
+			return nil
+		}
+		delete(result, "cursor_usage_presence")
+	}
 	delete(result, "cursor_usage_event_id")
 	delete(result, "cursor_usage_timestamp")
 	delete(result, "cursor_usage_stability_samples")

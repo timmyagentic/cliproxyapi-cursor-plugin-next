@@ -10,13 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
 )
 
-const version = "0.2.0"
+const version = "0.2.1"
 const pluginID = "cursor-next"
 const pluginLogo = "https://raw.githubusercontent.com/timmyagentic/cliproxyapi-cursor-plugin-next/main/assets/cursor.png"
 const cursorAPI = "https://api2.cursor.sh"
@@ -86,6 +87,7 @@ type rpcRequest struct {
 	Method           string
 	Path             string
 	Body             []byte
+	Query            url.Values
 
 	Provider        string
 	AuthID          string

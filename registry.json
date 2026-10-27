@@ -6,7 +6,7 @@
       "name": "Cursor Next",
       "description": "Cursor provider with native HTTP/2 tool continuations, bounded session recovery, separate measured Run accounting, streaming, images and quota support.",
       "author": "timmyagentic",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "repository": "https://github.com/timmyagentic/cliproxyapi-cursor-plugin-next",
       "homepage": "https://github.com/timmyagentic/cliproxyapi-cursor-plugin-next",
       "license": "MIT",

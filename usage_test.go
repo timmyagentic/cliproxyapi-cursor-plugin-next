@@ -55,6 +55,12 @@ func TestDashboardUsageCounterSemantics(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := map[string]any{"prompt_tokens": test.input, "completion_tokens": test.output, "total_tokens": test.input + test.output, "prompt_tokens_details": map[string]any{"cached_tokens": test.read, "cache_write_tokens": test.write}}
+			presence := object(got["cursor_usage_presence"])
+			_, cacheWritePresent := test.tokens["cacheWriteTokens"]
+			if presence["cache_write_tokens"] != cacheWritePresent {
+				t.Fatal("cache-write field presence was lost")
+			}
+			delete(got, "cursor_usage_presence")
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("usage=%v want=%v", got, want)
 			}

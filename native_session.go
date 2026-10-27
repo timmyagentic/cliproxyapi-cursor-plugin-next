@@ -26,14 +26,26 @@ type nativeInput struct {
 	Conversation                    chatConversation
 	CID, Account, Token, OwnerScope string
 	SourceFormat                    string
+	RequestedModel                  string
 }
 
 type nativeReceipt struct {
 	RunID, CID, RequestID, Account, ModelID, Protocol string
+	RequestedModel                                    string
 	Started                                           time.Time
+	ActiveMilliseconds                                int64
+	FirstOutputMilliseconds                           *int64
 	Resumed, Replay                                   bool
 	Delivered                                         func() `json:"-"`
 	token                                             string
+	accounting                                        *nativeAccountingLifecycle
+}
+
+// The lifecycle is created before admission. OnStart may attach one bounded
+// live-observation worker; OnEnd drains it before closing the journal record.
+type nativeAccountingLifecycle struct {
+	ctx  context.Context
+	done chan struct{}
 }
 
 type nativeLimits struct {
@@ -111,6 +123,9 @@ type nativeSession struct {
 	err                                                     error
 	usage                                                   map[string]any
 	started, expires                                        time.Time
+	activeSince                                             time.Time
+	activeElapsed                                           time.Duration
+	firstOutput                                             *time.Duration
 	lifetimeTimer, pendingTimer, batchTimer, replayTimer    *time.Timer
 	batchGeneration                                         uint64
 	waiting                                                 bool
@@ -260,9 +275,9 @@ func (ns *nativeSessions) Start(ctx context.Context, in nativeInput) (<-chan run
 	}
 	now := time.Now()
 	runCtx, cancel := context.WithCancel(ns.ctx)
-	s := &nativeSession{pool: ns, ctx: runCtx, cancel: cancel, limits: ns.limits, contract: contract, identity: strings.ReplaceAll(randomID(), "-", ""), tools: nativeCloneTools(in.Tools), execs: map[uint64]*nativeCall{}, seenExecs: map[uint64]string{}, internalReplies: map[uint64][][]byte{}, nativeIDs: map[string]uint64{}, blobs: blobs, bootstrap: map[string]bool{}, blobBytes: blobBytes, state: "opening", started: now, expires: now.Add(ns.limits.Lifetime), workDone: make(chan struct{}), endDone: make(chan struct{}), internalSteps: 1, admissionDone: make(chan struct{})}
+	s := &nativeSession{pool: ns, ctx: runCtx, cancel: cancel, limits: ns.limits, contract: contract, identity: strings.ReplaceAll(randomID(), "-", ""), tools: nativeCloneTools(in.Tools), execs: map[uint64]*nativeCall{}, seenExecs: map[uint64]string{}, internalReplies: map[uint64][][]byte{}, nativeIDs: map[string]uint64{}, blobs: blobs, bootstrap: map[string]bool{}, blobBytes: blobBytes, state: "opening", started: now, activeSince: now, expires: now.Add(ns.limits.Lifetime), workDone: make(chan struct{}), endDone: make(chan struct{}), internalSteps: 1, admissionDone: make(chan struct{})}
 	s.ownerScope = in.OwnerScope
-	s.receipt = nativeReceipt{RunID: randomID(), CID: in.CID, RequestID: randomID(), Account: in.Account, ModelID: in.Model.ID, Started: now, token: in.Token}
+	s.receipt = nativeReceipt{RunID: randomID(), CID: in.CID, RequestID: randomID(), Account: in.Account, ModelID: in.Model.ID, RequestedModel: in.RequestedModel, Started: now, token: in.Token, accounting: &nativeAccountingLifecycle{ctx: runCtx}}
 	for k := range blobs {
 		s.bootstrap[k] = true
 	}
@@ -466,6 +481,10 @@ func (s *nativeSession) emitLocked(ev runEvent) error {
 	if err := s.retainLocked(len(encodeJSON(map[string]any{"text": ev.text, "reasoning": ev.reasoning, "tool": ev.tool, "stop": ev.stop}))); err != nil {
 		return err
 	}
+	if s.firstOutput == nil && (ev.text != "" || ev.reasoning != "" || ev.tool != nil) {
+		elapsed := time.Since(s.started)
+		s.firstOutput = &elapsed
+	}
 	seg := s.segment
 	seg.events = append(seg.events, ev)
 	seg.content += ev.text
@@ -574,6 +593,7 @@ func (s *nativeSession) resume(ctx context.Context, in nativeInput, contract str
 	s.segments = append(s.segments, next)
 	s.turn++
 	s.internalSteps++
+	s.activeSince = time.Now()
 	s.state = "submitting"
 	s.heard = 0
 	s.waitSince = time.Now()
@@ -648,6 +668,7 @@ func (s *nativeSession) finishIf(err error, end runEvent, check func() bool) boo
 		return false
 	}
 	s.state = "finishing"
+	s.pauseActiveLocked(time.Now())
 	defer s.endOnce.Do(func() { close(s.endDone) })
 	s.err = err
 	for _, timer := range []*time.Timer{s.lifetimeTimer, s.pendingTimer, s.batchTimer, s.replayTimer} {
@@ -664,6 +685,11 @@ func (s *nativeSession) finishIf(err error, end runEvent, check func() bool) boo
 	}
 	tr := s.transport
 	receipt := s.receipt
+	receipt.ActiveMilliseconds = s.activeElapsed.Milliseconds()
+	if s.firstOutput != nil {
+		first := s.firstOutput.Milliseconds()
+		receipt.FirstOutputMilliseconds = &first
+	}
 	end.internalCalls = s.internalCalls
 	end.internalSteps = s.internalSteps
 	seg := s.segment
@@ -704,6 +730,17 @@ func (s *nativeSession) finishIf(err error, end runEvent, check func() bool) boo
 		s.pool.forget(s)
 	}
 	return true
+}
+
+// Timings use the monotonic clock carried by time.Time. Explicit timestamps
+// make exclusion of caller tool execution deterministic in unit tests.
+func (s *nativeSession) pauseActiveLocked(at time.Time) {
+	if !s.activeSince.IsZero() {
+		if elapsed := at.Sub(s.activeSince); elapsed > 0 {
+			s.activeElapsed += elapsed
+		}
+		s.activeSince = time.Time{}
+	}
 }
 
 func (s *nativeSession) pump() {

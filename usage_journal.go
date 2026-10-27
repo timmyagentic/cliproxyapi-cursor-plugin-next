@@ -33,12 +33,13 @@ var errUsageEventConflict = errors.New("usage observation has a conflicting even
 // Nil Usage is unknown; a nonnil zero is observed zero. Neither an observation
 // nor Stable constitutes an upstream finality guarantee.
 type usageMeasurement struct {
-	PromptTokens     int64  `json:"prompt_tokens"`
-	CompletionTokens int64  `json:"completion_tokens"`
-	TotalTokens      int64  `json:"total_tokens"`
-	CachedTokens     int64  `json:"cached_tokens"`
-	CacheWriteTokens int64  `json:"cache_write_tokens"`
-	ReasoningTokens  *int64 `json:"reasoning_tokens,omitempty"`
+	PromptTokens     int64           `json:"prompt_tokens"`
+	CompletionTokens int64           `json:"completion_tokens"`
+	TotalTokens      int64           `json:"total_tokens"`
+	CachedTokens     int64           `json:"cached_tokens"`
+	CacheWriteTokens int64           `json:"cache_write_tokens"`
+	ReasoningTokens  *int64          `json:"reasoning_tokens,omitempty"`
+	Observed         map[string]bool `json:"observed,omitempty"`
 }
 type usageObservation struct {
 	Revision uint64            `json:"revision"`
@@ -76,9 +77,16 @@ type usageRecord struct {
 	Observations      []usageObservation `json:"observations,omitempty"`
 	HistoryArchived   uint64             `json:"history_archived,omitempty"`
 	Conflicts         uint64             `json:"conflicts,omitempty"`
+	RequestedModel    string             `json:"requested_model,omitempty"`
+	ActiveInferenceMs *int64             `json:"active_inference_ms,omitempty"`
+	TTFTMs            *int64             `json:"ttft_ms,omitempty"`
+	LiveUsage         *usageMeasurement  `json:"live_usage,omitempty"`
+	LiveObservedAt    *time.Time         `json:"live_observed_at,omitempty"`
+	LiveEventID       string             `json:"live_event_id,omitempty"`
 }
 type usageJournalSnapshot struct {
 	Version               int           `json:"version"`
+	InstanceID            string        `json:"instance_id,omitempty"`
 	Sequence              uint64        `json:"sequence,omitempty"`
 	Segment               uint64        `json:"segment,omitempty"`
 	DroppedObservations   uint64        `json:"dropped_observations,omitempty"`
@@ -114,6 +122,7 @@ type usageJournalHealth struct {
 type usageJournal struct {
 	mu                                 sync.Mutex
 	path                               string
+	instanceID                         string
 	lock                               *os.File
 	closed                             bool
 	records                            []usageRecord
@@ -131,7 +140,7 @@ type usageJournal struct {
 }
 
 func newUsageJournal(path string) (*usageJournal, error) {
-	j := &usageJournal{path: path, now: time.Now, capacity: maxUsageJournalRecords, spoolCapacity: maxUsageSpoolRecords, reviewNext: map[string]int{}}
+	j := &usageJournal{path: path, instanceID: digest(randomID()), now: time.Now, capacity: maxUsageJournalRecords, spoolCapacity: maxUsageSpoolRecords, reviewNext: map[string]int{}}
 	if path != "" {
 		if reason := j.openStorage(path); reason != "" {
 			j.storageReason, j.blocked = reason, true
@@ -178,6 +187,12 @@ func (j *usageJournal) openStorage(path string) string {
 	snapshot := usageJournalSnapshot{Version: 2}
 	if err == nil && (decodeUsageJSON(raw, &snapshot) != nil || snapshot.Version != 1 && snapshot.Version != 2 || len(snapshot.Records) > maxUsageJournalRecords) {
 		return "corrupt_checkpoint"
+	}
+	if snapshot.InstanceID != "" {
+		if !isUsageHash(snapshot.InstanceID) {
+			return "corrupt_checkpoint"
+		}
+		j.instanceID = snapshot.InstanceID
 	}
 	ids, claims := map[string]bool{}, map[string]bool{}
 	for n := range snapshot.Records {
@@ -233,11 +248,17 @@ func (j *usageJournal) openStorage(path string) string {
 	}) != nil {
 		return "corrupt_log"
 	}
-	for n := range j.records {
-		r := &j.records[n]
+	var interrupted []usageRecord
+	for _, r := range j.records {
 		if r.Status == "running" {
 			r.Status, r.Reason, r.Ended = "unknown", "interrupted", r.Started
+			interrupted = append(interrupted, r)
 		}
+	}
+	// A collector may already hold the pre-crash cursor. Recovery is a new
+	// accounting event, not an invisible checkpoint-only state transition.
+	for _, r := range interrupted {
+		j.commit(r)
 	}
 	j.expire(j.records)
 	j.checkpointDirty = true
@@ -279,12 +300,18 @@ func decodeUsageJSON(raw []byte, target any) error {
 }
 func validUsageReason(reason string) bool {
 	switch reason {
-	case "", "unavailable", "cancelled", "timeout", "error", "restart", "interrupted", "expired", "ambiguous", "permission", "rate_limit", "storage", "conflict", "initial_wait", "missing", "observing", "revised", "settled", "invalid", "pagination_limit", "upstream_error":
+	case "", "unavailable", "cancelled", "timeout", "error", "restart", "interrupted", "expired", "ambiguous", "permission", "rate_limit", "storage", "conflict", "initial_wait", "missing", "observing", "revised", "settled", "invalid", "pagination_limit", "upstream_error", "pending_dashboard", "run_interrupted":
 		return true
 	}
 	return false
 }
 func validUsageRecord(r usageRecord) bool {
+	if r.RequestedModel != "" && !safeUsageID(r.RequestedModel) || r.ActiveInferenceMs != nil && *r.ActiveInferenceMs < 0 || r.TTFTMs != nil && *r.TTFTMs < 0 {
+		return false
+	}
+	if r.LiveUsage != nil && (!validUsageMeasurement(*r.LiveUsage) || r.LiveObservedAt == nil || r.LiveObservedAt.IsZero() || !isUsageHash(r.LiveEventID)) {
+		return false
+	}
 	if r.InternalToolCalls < 0 || r.InternalToolCalls > 100000 || r.InternalSteps < 0 || r.InternalSteps > 100000 || len(r.Observations) > maxUsageHistory {
 		return false
 	}
@@ -319,6 +346,12 @@ func cloneUsageMeasurement(u *usageMeasurement) *usageMeasurement {
 		return nil
 	}
 	copy := *u
+	if u.Observed != nil {
+		copy.Observed = make(map[string]bool, len(u.Observed))
+		for k, v := range u.Observed {
+			copy.Observed[k] = v
+		}
+	}
 	if u.ReasoningTokens != nil {
 		value := *u.ReasoningTokens
 		copy.ReasoningTokens = &value
@@ -327,6 +360,19 @@ func cloneUsageMeasurement(u *usageMeasurement) *usageMeasurement {
 }
 func cloneUsageRecord(r usageRecord) usageRecord {
 	r.Usage, r.FirstUsage = cloneUsageMeasurement(r.Usage), cloneUsageMeasurement(r.FirstUsage)
+	r.LiveUsage = cloneUsageMeasurement(r.LiveUsage)
+	if r.LiveObservedAt != nil {
+		at := *r.LiveObservedAt
+		r.LiveObservedAt = &at
+	}
+	if r.ActiveInferenceMs != nil {
+		n := *r.ActiveInferenceMs
+		r.ActiveInferenceMs = &n
+	}
+	if r.TTFTMs != nil {
+		n := *r.TTFTMs
+		r.TTFTMs = &n
+	}
 	r.Observations = append([]usageObservation(nil), r.Observations...)
 	for n := range r.Observations {
 		r.Observations[n].Usage = cloneUsageMeasurement(r.Observations[n].Usage)
@@ -521,12 +567,12 @@ func (j *usageJournal) ClaimOwner(account, event string) (string, error) {
 }
 func (j *usageJournal) claimOwnerLocked(account, event string) (string, error) {
 	for _, r := range j.records {
-		if r.Account == account && r.EventID == event {
+		if r.Account == account && (r.EventID == event || r.LiveEventID == event) {
 			return r.ID, nil
 		}
 	}
 	for _, entry := range j.spool {
-		if entry.Record.Account == account && entry.Record.EventID == event {
+		if entry.Record.Account == account && (entry.Record.EventID == event || entry.Record.LiveEventID == event) {
 			return entry.Record.ID, nil
 		}
 	}
@@ -574,6 +620,13 @@ func (j *usageJournal) claimPath(account, event string) string {
 	return filepath.Join(j.path+".claims", key[:2], key+".claim")
 }
 func (j *usageJournal) persistClaim(r usageRecord) error {
+	if r.LiveEventID != "" && r.LiveEventID != r.EventID {
+		live := r
+		live.EventID, live.LiveEventID = r.LiveEventID, ""
+		if err := j.persistClaim(live); err != nil {
+			return err
+		}
+	}
 	if r.EventID == "" {
 		return nil
 	}
@@ -1053,7 +1106,7 @@ func (j *usageJournal) checkpoint() error {
 		return nil
 	}
 	snapshot := func() ([]byte, error) {
-		return json.Marshal(usageJournalSnapshot{Version: 2, Sequence: j.sequence, Segment: j.segment, DroppedObservations: j.dropped, LostRecords: j.lost, AttributionIncomplete: j.attributionIncomplete, Records: j.records})
+		return json.Marshal(usageJournalSnapshot{Version: 2, InstanceID: j.instanceID, Sequence: j.sequence, Segment: j.segment, DroppedObservations: j.dropped, LostRecords: j.lost, AttributionIncomplete: j.attributionIncomplete, Records: j.records})
 	}
 	raw, err := snapshot()
 	for err == nil && len(raw) > maxUsageJournalBytes && len(j.records) > 1 {
@@ -1162,6 +1215,16 @@ func validUsageMeasurement(u usageMeasurement) bool {
 
 func measurementFromUsage(usage map[string]any) (*usageMeasurement, error) {
 	u := &usageMeasurement{}
+	if observed := object(usage["cursor_usage_presence"]); observed != nil {
+		u.Observed = make(map[string]bool, len(observed))
+		for k, v := range observed {
+			known, ok := v.(bool)
+			if !ok {
+				return nil, errUsageJournal
+			}
+			u.Observed[k] = known
+		}
+	}
 	values := []struct {
 		value any
 		out   *int64

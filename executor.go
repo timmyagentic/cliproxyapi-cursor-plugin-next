@@ -110,7 +110,7 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 		if stream {
 			stopOpening = s.watchNativeOpening(req.StreamID, id, model, created, time.Second)
 		}
-		events, r, err = sessions.Start(s.ctx, nativeInput{Chat: chat, Model: resolution, Tools: tools, Conversation: conv, CID: cid, OwnerScope: nativeOwnerScope(chat, req, cid), Account: account, Token: token, SourceFormat: nativeSourceFormat(req)})
+		events, r, err = sessions.Start(s.ctx, nativeInput{Chat: chat, Model: resolution, Tools: tools, Conversation: conv, CID: cid, OwnerScope: nativeOwnerScope(chat, req, cid), Account: account, Token: token, SourceFormat: nativeSourceFormat(req), RequestedModel: accountingRequestedModel(req, chat.Model)})
 		stopOpening()
 		if err != nil {
 			return nil, err
@@ -211,6 +211,9 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 	}
 	if accounting != nil {
 		body["cursor_usage"] = accounting
+		if ref := nativeUsageAccounting(accounting); ref != nil {
+			body["usage_accounting"] = ref
+		}
 	}
 	if receipt != nil && receipt.Delivered != nil {
 		receipt.Delivered()
@@ -247,6 +250,9 @@ func streamReply(s *requestScope, streamID string, events <-chan runEvent, first
 		}
 		if accounting != nil {
 			value["cursor_usage"] = accounting
+			if ref := nativeUsageAccounting(accounting); ref != nil {
+				value["usage_accounting"] = ref
+			}
 		}
 		return emit(value)
 	}

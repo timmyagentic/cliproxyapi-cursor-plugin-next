@@ -456,8 +456,10 @@ func dashboardUsage(tokens map[string]any) (map[string]any, error) {
 		return nil, errors.New("dashboard tokenUsage message missing")
 	}
 	counts := make(map[string]int64, 5)
+	seen := make(map[string]bool, 5)
 	for _, key := range []string{"inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"} {
 		raw, exists := tokens[key]
+		seen[key] = exists
 		if !exists {
 			// Verified wire behavior: zero proto3 scalar counters are omitted
 			// even when their enclosing tokenUsage message is present.
@@ -476,6 +478,14 @@ func dashboardUsage(tokens map[string]any) (map[string]any, error) {
 		return nil, errors.New("dashboard token total exceeds exact JSON range")
 	}
 	usage := map[string]any{"prompt_tokens": input, "completion_tokens": counts["outputTokens"], "total_tokens": total, "prompt_tokens_details": map[string]any{"cached_tokens": counts["cacheReadTokens"], "cache_write_tokens": counts["cacheWriteTokens"]}}
+	wholeInput := seen["inputTokens"] && seen["cacheReadTokens"] && seen["cacheWriteTokens"]
+	reportedInput := seen["inputTokens"] || seen["cacheReadTokens"] || seen["cacheWriteTokens"]
+	usage["cursor_usage_presence"] = map[string]any{
+		"prompt_tokens": wholeInput, "completion_tokens": seen["outputTokens"],
+		"total_tokens": wholeInput && seen["outputTokens"], "cached_tokens": seen["cacheReadTokens"],
+		"cache_write_tokens": seen["cacheWriteTokens"], "reasoning_tokens": tokens["reasoningTokens"] != nil,
+		"reported_input_tokens": reportedInput, "reported_total_tokens": reportedInput && seen["outputTokens"],
+	}
 	if raw, exists := tokens["reasoningTokens"]; exists {
 		reasoning, ok := usageInteger(raw)
 		if !ok || reasoning > counts["outputTokens"] {

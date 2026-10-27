@@ -26,6 +26,7 @@ var apacheLicense string
 
 func accountingConfigFields() []any {
 	return []any{
+		map[string]any{"Name": "client-context-estimate", "Type": "boolean", "Default": false, "Description": "Opt in to host-provided local tokenizer estimates for Responses client context/auto-compaction. Client token displays and budgets use estimates; measured billing stays in the separate Run ledger. Requires a supporting CPA host."},
 		map[string]any{"Name": "transport", "Type": "string", "Default": "auto", "Description": "auto uses native sessions when native-proxy-url is explicit; host keeps CPA HTTP; native requires explicit proxy configuration."},
 		map[string]any{"Name": "native-proxy-url", "Type": "string", "Default": "", "Description": "Explicit native Run proxy: direct, http://, https://, socks5:// or socks5h://. Empty retains CPA host transport. Match the host's approved route; never inferred."},
 		map[string]any{"Name": "usage-journal", "Type": "string", "Default": "", "Description": "Absolute JSON path in a private directory. Enables durable, separate usage reconciliation; empty uses memory only."},

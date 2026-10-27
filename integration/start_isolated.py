@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--proxy-config", type=Path)
     parser.add_argument("--transport", choices=("auto", "host", "native"), default="auto")
     parser.add_argument("--native-proxy-url", help="Explicit native transport proxy; never printed")
+    parser.add_argument("--client-context-estimate", action="store_true", help="Opt in to supporting CPA hosts' client-only context estimates; never billed measurements")
     parser.add_argument("--port", type=int, default=28347)
     args = parser.parse_args()
     if args.transport == "native" and not args.native_proxy_url:
@@ -70,6 +71,7 @@ def main():
             config["requests"]["proxy-url"] = proxy
     plugin_config = config["plugins"]["configs"]["cursor-next"]
     plugin_config["transport"] = args.transport
+    plugin_config["client-context-estimate"] = args.client_context_estimate
     if args.native_proxy_url:
         plugin_config["native-proxy-url"] = args.native_proxy_url
     config_path = root / "config.yaml"

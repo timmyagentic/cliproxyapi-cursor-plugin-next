@@ -12,8 +12,9 @@ import (
 // An executor callback does not include the host's effective proxy/TLS policy.
 // Empty proxy therefore means host-owned HTTP, never implicit direct access.
 type nativeConfig struct {
-	Mode  string `yaml:"transport"`
-	Proxy string `yaml:"native-proxy-url"`
+	Mode                  string `yaml:"transport"`
+	Proxy                 string `yaml:"native-proxy-url"`
+	ClientContextEstimate bool   `yaml:"client-context-estimate"`
 }
 
 func parseNativeConfig(raw []byte) (nativeConfig, error) {
@@ -65,6 +66,9 @@ func (p *pluginRuntime) configureNativeLocked(cfg nativeConfig) error {
 			if err := p.beginNativeAccounting(receipt); err != nil {
 				return err
 			}
+			p.startNativeLiveAccounting(receipt, func(ctx context.Context, body map[string]any) (map[string]any, error) {
+				return pool.JSON(ctx, receipt.Account, receipt.token, "/aiserver.v1.DashboardService/GetFilteredUsageEvents", body)
+			}, nativeLiveUsageInterval)
 			// Revisit mutable or missing older events during this Run, rather
 			// than freezing the first observed Dashboard snapshot forever.
 			_ = p.startNativeBackground(2*time.Second, func(ctx context.Context) {
@@ -100,11 +104,21 @@ func (p *pluginRuntime) beginNativeAccounting(receipt nativeReceipt) error {
 	// Disk failures do not discard a valid inference. The fallback ID is the
 	// same deterministic record ID and journal health exposes the failure.
 	_, _ = p.journal.Begin(receipt.Account, receipt.CID, receipt.RequestID, receipt.ModelID, receipt.Started)
+	if receipt.RequestedModel != "" {
+		_ = p.journal.SetRunMetadata(nativeRecordID(receipt), receipt.RequestedModel)
+	}
 	return nil
 }
 
 func (p *pluginRuntime) endNativeAccounting(pool *nativeTransportPool, receipt nativeReceipt, terminal runEvent, runErr error) {
+	// Session cancellation occurs before OnEnd. Wait for the current bounded
+	// observation before closing the record so late live snapshots cannot
+	// overwrite terminal accounting or revive a closed Run.
+	if receipt.accounting != nil && receipt.accounting.done != nil {
+		<-receipt.accounting.done
+	}
 	id, ended := nativeRecordID(receipt), p.now()
+	_ = p.journal.SetNativeTiming(id, receipt.ActiveMilliseconds, receipt.FirstOutputMilliseconds)
 	_ = p.journal.SetInternalToolCalls(id, terminal.internalCalls)
 	_ = p.journal.SetInternalSteps(id, terminal.internalSteps)
 	_ = p.journal.Close(id, ended)
@@ -133,6 +147,77 @@ func (p *pluginRuntime) endNativeAccounting(pool *nativeTransportPool, receipt n
 		})
 	}
 	p.releaseUsageRun(receipt.Account, receipt.CID)
+}
+
+const nativeLiveUsageInterval = 10 * time.Second
+const nativeLiveUsageDeadline = 2 * time.Second
+
+// Live observations carry the same event identity and revision semantics as
+// final reconciliation. They are provisional Run counters, never per-request
+// current-context usage, and are collected on runtime-owned transport only.
+func (p *pluginRuntime) startNativeLiveAccounting(receipt nativeReceipt, fetch usageFetcher, interval time.Duration) {
+	lifecycle := receipt.accounting
+	if lifecycle == nil || lifecycle.ctx == nil || lifecycle.done != nil || interval <= 0 {
+		return
+	}
+	lifecycle.done = make(chan struct{})
+	if err := p.startNativeBackground(defaultNativeLimits().Lifetime, func(ctx context.Context) {
+		defer close(lifecycle.done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-lifecycle.ctx.Done():
+				return
+			case <-ticker.C:
+				ask, cancel := context.WithTimeout(lifecycle.ctx, nativeLiveUsageDeadline)
+				_ = p.observeNativeLiveUsage(ask, receipt, fetch)
+				cancel()
+			}
+		}
+	}); err != nil {
+		close(lifecycle.done)
+	}
+}
+
+func (p *pluginRuntime) observeNativeLiveUsage(ctx context.Context, receipt nativeReceipt, fetch usageFetcher) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	policy := p.usagePolicy
+	p.mu.Unlock()
+	// The whole scan is limited by the caller's two-second context; any
+	// incomplete pagination or ambiguous matching omits this observation.
+	policy.Ask = nativeLiveUsageDeadline
+	policy.MaxPages = min(policy.MaxPages, 4)
+	id := nativeRecordID(receipt)
+	var claimErr error
+	usage, err := fetchUsagePagesWithOptions(ctx, usageWindow{receipt.CID, receipt.ModelID, receipt.Started, p.now()}, fetch, policy, UsageResolveOptions{
+		ExcludeEvent: func(eventID string) bool {
+			owner, err := p.journal.ClaimOwner(receipt.Account, eventID)
+			if err != nil {
+				claimErr = err
+				return true
+			}
+			return owner != "" && owner != id
+		},
+	})
+	if claimErr != nil {
+		return claimErr
+	}
+	if err != nil || usage == nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !p.unambiguousUsage(receipt.Account, receipt.CID, id, usage) {
+		return usageUnavailable(UsageAmbiguous, "overlapping unresolved Run")
+	}
+	return p.journal.ObserveLive(id, usage)
 }
 
 func (p *pluginRuntime) nativeTerminal(receipt nativeReceipt, terminal runEvent) runEvent {
@@ -164,6 +249,9 @@ func (p *pluginRuntime) nativeTerminal(receipt nativeReceipt, terminal runEvent)
 		"internal_tool_calls": terminal.internalCalls, "observed_internal_steps": terminal.internalSteps,
 		"journal": p.journal.Health(),
 	}
+	p.mu.Lock()
+	terminal.accounting["client_context_estimate"] = p.nativeConfig.ClientContextEstimate
+	p.mu.Unlock()
 	if runUsage != nil {
 		terminal.accounting["run_usage"] = runUsage
 	}

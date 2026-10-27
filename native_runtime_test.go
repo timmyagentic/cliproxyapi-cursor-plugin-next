@@ -10,10 +10,112 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func nativeLiveTestReceipt() nativeReceipt {
+	return nativeReceipt{RunID: "synthetic-live-run", RequestID: "synthetic-live-request", CID: "synthetic-live-conversation", Account: digest("synthetic-live-account"), ModelID: "grok-4.7-medium-fast", RequestedModel: "grok-4.7-fast", Started: time.Now().Add(-time.Second)}
+}
+
+func nativeLiveTestPage(receipt nativeReceipt) map[string]any {
+	return usageTestPage(map[string]any{"usageEventId": "synthetic-live-event", "conversationId": receipt.CID, "model": receipt.ModelID, "timestamp": strconv.FormatInt(receipt.Started.Add(100*time.Millisecond).UnixMilli(), 10), "tokenUsage": map[string]any{"inputTokens": 100, "cacheReadTokens": 900, "outputTokens": 40}})
+}
+
+func TestNativeLiveAccountingRecordsProvisionalRunUsage(t *testing.T) {
+	p := newTestRuntime(t)
+	r := nativeLiveTestReceipt()
+	if err := p.beginNativeAccounting(r); err != nil {
+		t.Fatal(err)
+	}
+	defer p.releaseUsageRun(r.Account, r.CID)
+	err := p.observeNativeLiveUsage(context.Background(), r, func(ctx context.Context, body map[string]any) (map[string]any, error) {
+		if body["pageSize"] != p.usagePolicy.PageSize || ctx.Err() != nil {
+			t.Fatal("live accounting lost bounded account-scoped policy")
+		}
+		return nativeLiveTestPage(r), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, ok := p.journal.Record(nativeRecordID(r))
+	if !ok || record.LiveUsage == nil || record.LiveUsage.PromptTokens != 1000 || record.Usage != nil || !record.Ended.IsZero() || !record.Provisional || record.Stable {
+		t.Fatalf("live data must remain a provisional active Run snapshot: %+v", record)
+	}
+}
+
+func TestNativeLiveAccountingRejectsForeignOrAmbiguousEvents(t *testing.T) {
+	for _, kind := range []string{"foreign-conversation", "foreign-model", "foreign-time", "ambiguous"} {
+		t.Run(kind, func(t *testing.T) {
+			p := newTestRuntime(t)
+			r := nativeLiveTestReceipt()
+			if err := p.beginNativeAccounting(r); err != nil {
+				t.Fatal(err)
+			}
+			defer p.releaseUsageRun(r.Account, r.CID)
+			page := nativeLiveTestPage(r)
+			event := page["usageEventsDisplay"].([]any)[0].(map[string]any)
+			switch kind {
+			case "foreign-conversation":
+				event["conversationId"] = "synthetic-other-conversation"
+			case "foreign-model":
+				event["model"] = "synthetic-other-model"
+			case "foreign-time":
+				event["timestamp"] = strconv.FormatInt(r.Started.Add(-time.Minute).UnixMilli(), 10)
+			case "ambiguous":
+				other := copyMap(event)
+				other["usageEventId"] = "synthetic-other-event"
+				page = usageTestPage(event, other)
+			}
+			_ = p.observeNativeLiveUsage(context.Background(), r, func(context.Context, map[string]any) (map[string]any, error) { return page, nil })
+			record, _ := p.journal.Record(nativeRecordID(r))
+			if record.LiveUsage != nil || record.Usage != nil {
+				t.Fatal("unrelated or ambiguous Dashboard event was assigned to active Run")
+			}
+		})
+	}
+}
+
+func TestNativeLiveWorkerDrainsBeforeTerminalAccounting(t *testing.T) {
+	p := newTestRuntime(t)
+	r := nativeLiveTestReceipt()
+	ctx, cancel := context.WithCancel(p.ctx)
+	defer cancel()
+	r.accounting = &nativeAccountingLifecycle{ctx: ctx}
+	if err := p.beginNativeAccounting(r); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 1)
+	var queries atomic.Int32
+	p.startNativeLiveAccounting(r, func(ctx context.Context, body map[string]any) (map[string]any, error) {
+		queries.Add(1)
+		entered <- struct{}{}
+		<-ctx.Done()
+		// Even a transport returning a body at cancellation may not publish a
+		// live revision after the final record has been committed.
+		return nativeLiveTestPage(r), nil
+	}, time.Millisecond)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("live observation worker did not start")
+	}
+	cancel()
+	terminalUsage := usageFromFields([]pbField{{number: 1, wire: 0, n: 50}, {number: 2, wire: 0, n: 5}})
+	done := make(chan struct{})
+	go func() { p.endNativeAccounting(nil, r, runEvent{stop: "stop", usage: terminalUsage}, nil); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("final accounting did not drain the cancelled live worker")
+	}
+	record, _ := p.journal.Record(nativeRecordID(r))
+	if record.Usage == nil || record.Usage.PromptTokens != 50 || record.Source != "turn_ended" || record.Ended.IsZero() || queries.Load() != 1 {
+		t.Fatalf("late live observation replaced terminal usage: %+v", record)
+	}
+}
 
 func TestNativeRuntimeKeepsOneRunJournalAcrossToolRequests(t *testing.T) {
 	t.Setenv("CURSOR_USAGE_JOURNAL", "")

@@ -8,7 +8,9 @@
 
 使用 `make test`、`make build` 构建，macOS 产物为 `dist/cursor-next.dylib`。插件 ID 为 `cursor-next`，provider 仍为 `cursor`。持久化计量需在插件配置里设置 `usage-journal`，目录权限为 0700、文件为 0600；不设置时仅保存在内存中。完整配置见[英文说明](README.md)。
 
-这是 0.2.0 源码/构建候选，不会自动替换现用插件或发布。先按[验证说明](VALIDATION.md)运行独立宿主，再按[安装与回退方案](docs/installation-and-rollback.md)切换。
+这是 0.2.1 源码/构建候选，不会自动替换现用插件或发布。先按[验证说明](VALIDATION.md)运行独立宿主，再按[安装与回退方案](docs/installation-and-rollback.md)切换。
+
+0.2.1 补充可修订的 Run 用量接口、请求与 Run 的关联、运行中的后台计量及排除工具等待的耗时。配套 CPA 与桌面端按 Run 去重汇总，逐请求未知值保留未知；迟到或下调的用量会更新原记录。`client-context-estimate` 可显式开启客户端上下文本地分词估算，支持客户端自动压缩；客户端 Token 展示和预算也将使用估算，真实计费、缓存和用量仍来自独立账本。完整方案见[原生会话设计](docs/native-sessions.md)。
 
 0.2.0 参考 Magpie Cursor 0.2.23 重构原生传输与工具续接：HTTP/2 双向 Run、连接复用、工具结果继续同一次 Run、完整结果批次校验、重复请求回放、超时与取消，以及后台 Run 计量核对。Chat 流改为原始 JSON，由 CPA 统一包装 SSE，修复双重 `data:`。
 
