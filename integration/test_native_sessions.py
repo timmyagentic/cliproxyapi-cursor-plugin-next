@@ -11,7 +11,7 @@ from unittest.mock import patch
 import native_sessions
 from native_sessions import (MODEL, RECEIPT_GRAMMAR, SCHEMA_BYTES, STATE_ROOT, ReceiptProtocol, StreamResult,
                              append_turn, canonical_name, compare, consume_sse, continuity, dashboard_evidence,
-                             digest, encode, journal_snapshot, make_tools, private_path, run_protocol, sanitize_error)
+                             custom_packet_shape, digest, encode, journal_snapshot, make_tools, private_path, run_protocol, sanitize_error)
 
 
 def sse(*events):
@@ -51,12 +51,28 @@ class NativeSessionTests(unittest.TestCase):
         self.assertEqual(tools[2]["format"], {"type": "grammar", "syntax": "lark", "definition": RECEIPT_GRAMMAR})
 
     def test_custom_grammar_packet_validation_requires_exact_json_language(self):
-        receipt = ReceiptProtocol("ab" * 20, step=3, custom_grammar=True)
-        valid = {"step": 4, "receipt": receipt.receipt}
-        receipt.execute({"name": "receipt_seal", "type": "custom_tool_call", "input": json.dumps(valid)})
-        receipt = ReceiptProtocol("ab" * 20, step=3, custom_grammar=True)
-        with self.assertRaisesRegex(ValueError, "Lark grammar"):
-            receipt.execute({"name": "receipt_seal", "input": json.dumps({"receipt": receipt.receipt, "step": 4})})
+        for valid in ({"step": 4, "receipt": "ab" * 20}, {"receipt": "ab" * 20, "step": 4}):
+            receipt = ReceiptProtocol("ab" * 20, step=3, custom_grammar=True)
+            receipt.execute({"name": "receipt_seal", "type": "custom_tool_call", "input": json.dumps(valid)})
+
+    def test_custom_grammar_rejects_wrong_fields_types_and_lengths(self):
+        packets = [{"step": 4.0, "receipt": "ab" * 20}, {"step": True, "receipt": "ab" * 20},
+                   {"step": "4", "receipt": "ab" * 20}, {"step": 4, "receipt": "ab" * 20, "extra": 1},
+                   {"step": 4, "receipt": "ab" * 19}, {"step": 4, "receipt": 1234}, {"step": 4, "other": "ab" * 20}]
+        for packet in packets:
+            with self.subTest(types={key: type(value).__name__ for key, value in packet.items()}):
+                with self.assertRaises(ValueError):
+                    ReceiptProtocol("ab" * 20, step=3, custom_grammar=True).execute({"name": "receipt_seal", "input": json.dumps(packet)})
+        with self.assertRaisesRegex(ValueError, "integer"):
+            ReceiptProtocol("seed").execute({"name": "receipt_seed", "arguments": '{"step":true,"receipt":"seed"}'})
+
+    def test_custom_failure_metadata_contains_shape_without_raw_values(self):
+        value = {"receipt": "ab" * 20, "step": 4}
+        shape = custom_packet_shape(json.dumps(value))
+        self.assertEqual(shape["key_order"], ["receipt", "step"])
+        self.assertEqual(shape["field_types"], {"step": "int", "receipt": "str"})
+        self.assertEqual(shape["field_lengths"], {"receipt": 40})
+        self.assertNotIn("ab" * 20, json.dumps(shape))
 
     def test_scope_check_uses_configurable_portable_root(self):
         self.assertEqual(private_path(STATE_ROOT / "evidence"), STATE_ROOT / "evidence")

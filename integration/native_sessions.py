@@ -27,12 +27,17 @@ STATE_ROOT = Path(os.environ.get("CURSOR_NATIVE_TEST_ROOT", Path(__file__).resol
 MODEL = "cursor/grok-4.7@500k"
 SCHEMA_BYTES = 442107
 TOOL_COUNT = 33
+FIXTURE_REVISION = 2
+FIXTURE_V2_REASON = ("Fixture v1 host full-tools failed its extra fixed-JSON-key-order grammar restriction. "
+                     "Fixture v2 explicitly accepts both orders of the same two fields; the v1 failure remains failed and is excluded from v2 comparisons.")
 STEPS = ("receipt_seed", "synthetic_receipts.advance", "synthetic_receipts.advance", "receipt_seal")
-RECEIPT_GRAMMAR = r'''start: "{" "\"step\"" ":" "4" "," "\"receipt\"" ":" RECEIPT "}"
+RECEIPT_GRAMMAR = r'''start: "{" (step "," receipt | receipt "," step) "}"
+step: "\"step\"" ":" "4"
+receipt: "\"receipt\"" ":" RECEIPT
 RECEIPT: /"[0-9a-f]{40}"/
-%import common.WS
+WS: /[ \t\r\n]+/
 %ignore WS'''
-RECEIPT_GRAMMAR_PACKET = re.compile(r'\s*\{\s*"step"\s*:\s*4\s*,\s*"receipt"\s*:\s*"[0-9a-f]{40}"\s*\}\s*')
+RECEIPT_GRAMMAR_PACKET = re.compile(r'\s*\{\s*(?:"step"\s*:\s*4\s*,\s*"receipt"\s*:\s*"[0-9a-f]{40}"|"receipt"\s*:\s*"[0-9a-f]{40}"\s*,\s*"step"\s*:\s*4)\s*\}\s*')
 TOKEN_FIELDS = {"input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "total_tokens",
                 "cached_tokens", "cache_write_tokens", "reasoning_tokens", "input_tokens_details",
                 "output_tokens_details", "prompt_tokens_details", "completion_tokens_details"}
@@ -113,6 +118,24 @@ def canonical_name(call):
     if name in ("synthetic_receipts.advance", "synthetic_receipts__advance"):
         return "synthetic_receipts.advance"
     return name
+
+
+def custom_packet_shape(value):
+    """Diagnostic shape only: no argument values, prompts, or receipt bytes."""
+    shape = {"input_type": type(value).__name__, "input_bytes": len(value.encode()) if isinstance(value, str) else None}
+    if not isinstance(value, str):
+        return shape
+    try:
+        parsed = json.loads(value)
+        if not isinstance(parsed, dict):
+            return {**shape, "json_type": type(parsed).__name__}
+        pairs = json.loads(value, object_pairs_hook=lambda items: items)
+        shape["key_order"] = [key if key in ("step", "receipt") else "[unexpected-key]" for key, _ in pairs]
+        shape["field_types"] = {key: type(parsed[key]).__name__ for key in ("step", "receipt") if key in parsed}
+        shape["field_lengths"] = {key: len(parsed[key]) for key in ("step", "receipt") if key in parsed and isinstance(parsed[key], (str, list, dict))}
+    except (ValueError, TypeError):
+        shape["key_order"] = None
+    return shape
 
 
 @dataclass
@@ -456,6 +479,8 @@ def run_protocol(args, protocol, key, root):
                 if call["call_id"] in call_ids:
                     raise ValueError("tool call ID was reused across distinct tool executions")
                 call_ids.append(call["call_id"])
+                if protocol == "responses" and canonical_name(call) == "receipt_seal":
+                    row["custom_packet_shape"] = custom_packet_shape(call.get("input"))
                 if protocol == "responses" and canonical_name(call) == "receipt_seal" and call["type"] != "custom_tool_call":
                     raise ValueError("Responses custom tool shape was lost")
                 if protocol == "responses" and canonical_name(call) == "synthetic_receipts.advance" and call.get("namespace") != "synthetic_receipts":
@@ -540,7 +565,7 @@ def dashboard_evidence(report, fixture):
 
 
 def compare(native, stateless, dashboard_native=None, dashboard_stateless=None):
-    keys = ("scenario", "model", "service_tier", "reasoning_effort", "context_window", "auto_compact_token_limit", "tool_count", "tool_schema_bytes", "padding_units", "chunk_units", "custom_grammar", "custom_grammar_sha256")
+    keys = ("fixture_revision", "scenario", "model", "service_tier", "reasoning_effort", "context_window", "auto_compact_token_limit", "tool_count", "tool_schema_bytes", "padding_units", "chunk_units", "custom_grammar", "custom_grammar_sha256")
     mismatches = [key for key in keys if native.get("conditions", {}).get(key) != stateless.get("conditions", {}).get(key)]
     for key in ("cpa_sha256", "plugin_sha256", "credential_sha256", "effective_proxy_sha256", "usage_wait_ms", "request_retry"):
         if native.get("isolation", {}).get(key) is None or native.get("isolation", {}).get(key) != stateless.get("isolation", {}).get(key):
@@ -613,12 +638,12 @@ def main(argv=None):
     args.padding_units = args.padding_units if args.padding_units is not None else (100000 if args.scenario == "stress" else 0)
     if min(args.padding_units, args.chunk_units) < 0 or args.max_requests < 6 or args.timeout <= 0 or args.request_timeout <= 0:
         parser.error("invalid bounded workload")
-    conditions = {"scenario": args.scenario, "model": MODEL, "service_tier": "priority", "reasoning_effort": "medium", "context_window": 500000,
+    conditions = {"fixture_revision": FIXTURE_REVISION, "scenario": args.scenario, "model": MODEL, "service_tier": "priority", "reasoning_effort": "medium", "context_window": 500000,
                   "auto_compact_token_limit": 400000, "tool_count": args.tool_count, "tool_schema_bytes": args.tool_schema_bytes,
                   "padding_units": args.padding_units, "chunk_units": args.chunk_units,
                   "custom_grammar": args.custom_grammar, "custom_grammar_sha256": digest(RECEIPT_GRAMMAR) if args.custom_grammar else None}
     if args.dry_run:
-        print(json.dumps({"dry_run": True, "conditions": conditions, "max_http_requests": 12 if args.protocol == "both" else 6,
+        print(json.dumps({"dry_run": True, "conditions": conditions, "fixture_change_reason": FIXTURE_V2_REASON, "max_http_requests": 12 if args.protocol == "both" else 6,
                           "schema_source": "small synthetic smoke" if args.scenario == "smoke" else "synthetic tools matching observed count and serialized byte footprint", "stress_coverage": "500K route, not proof of 500K occupancy"}, indent=2))
         return 0
     args.state_dir = private_path(args.state_dir)
@@ -635,7 +660,7 @@ def main(argv=None):
     reports = [run_protocol(args, protocol, keys["client"], root) for protocol in (("chat", "responses") if args.protocol == "both" else (args.protocol,))]
     summary = {"arm": args.arm, "conditions": conditions, "isolation": isolation, "protocols": reports,
                "functional_passed": all(row["functional_passed"] for row in reports),
-               "limitations": ["tool definitions are synthetic; full tools/stress match observed count/bytes, smoke is intentionally smaller", "schema padding uses explanatory prose; bytes are not a token count", f"{args.padding_units} synthetic padding units are not an exact tokenizer count or proof of 500K occupancy", "HTTP probes do not test Codex auto-compaction", "Dashboard billing-event correlation requires separate metadata evidence", "missing usage remains absent", "validating custom receipt text against the grammar does not prove upstream grammar-constrained decoding"]}
+               "limitations": [FIXTURE_V2_REASON, "tool definitions are synthetic; full tools/stress match observed count/bytes, smoke is intentionally smaller", "schema padding uses explanatory prose; bytes are not a token count", f"{args.padding_units} synthetic padding units are not an exact tokenizer count or proof of 500K occupancy", "HTTP probes do not test Codex auto-compaction", "Dashboard billing-event correlation requires separate metadata evidence", "missing usage remains absent", "validating custom receipt text against the grammar does not prove upstream grammar-constrained decoding"]}
     (root / "summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps({"arm": args.arm, "functional_passed": summary["functional_passed"], "output": str(root),
                       "protocols": [{"protocol": row["protocol"], "functional_passed": row["functional_passed"], "issues": row["issues"]} for row in reports]}, indent=2))
