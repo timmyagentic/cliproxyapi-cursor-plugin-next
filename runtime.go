@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const version = "0.1.3"
+const version = "0.2.0"
 const pluginID = "cursor-next"
 const pluginLogo = "https://raw.githubusercontent.com/timmyagentic/cliproxyapi-cursor-plugin-next/main/assets/cursor.png"
 const cursorAPI = "https://api2.cursor.sh"
@@ -82,24 +82,26 @@ type rpcRequest struct {
 	Path             string
 	Body             []byte
 
-	Provider       string
-	AuthID         string
-	AuthProvider   string
-	FileName       string
-	RawJSON        []byte
-	StorageJSON    []byte
-	Metadata       map[string]any
-	AuthMetadata   map[string]any
-	Attributes     map[string]string
-	AuthAttributes map[string]string
-	Host           struct{ ProxyURL string }
-	State          string
-	Model          string
-	Format         string
-	Payload        []byte
-	CallbackID     string `json:"host_callback_id"`
-	StreamID       string `json:"stream_id"`
-	ConfigYAML     []byte `json:"config_yaml"`
+	Provider        string
+	AuthID          string
+	AuthProvider    string
+	FileName        string
+	RawJSON         []byte
+	StorageJSON     []byte
+	Metadata        map[string]any
+	AuthMetadata    map[string]any
+	Attributes      map[string]string
+	AuthAttributes  map[string]string
+	Host            struct{ ProxyURL string }
+	State           string
+	Model           string
+	Format          string
+	SourceFormat    string
+	OriginalRequest []byte
+	Payload         []byte
+	CallbackID      string `json:"host_callback_id"`
+	StreamID        string `json:"stream_id"`
+	ConfigYAML      []byte `json:"config_yaml"`
 }
 
 func parseRequest(raw []byte, method string) (rpcRequest, error) {
@@ -146,6 +148,10 @@ type pluginRuntime struct {
 	streamWorkers  sync.WaitGroup
 	journalPath    string
 	reconciling    map[string]bool
+	nativeConfig   nativeConfig
+	nativePool     *nativeTransportPool
+	nativeSessions *nativeSessions
+	nativeRequests int
 }
 
 func newRuntime() *pluginRuntime {
@@ -158,6 +164,14 @@ func (p *pluginRuntime) stop() {
 	p.closed = true
 	p.mu.Unlock()
 	p.cancel()
+	// Native Runs belong to this plugin instance, including parked tool turns.
+	// Their completion hooks must finish before the accounting journal closes.
+	if p.nativeSessions != nil {
+		_ = p.nativeSessions.Close()
+	}
+	if p.nativePool != nil {
+		p.nativePool.Close()
+	}
 	// Scope shutdown waits for outstanding callbacks before releasing journal ownership.
 	p.mu.Lock()
 	scopes := make([]*requestScope, 0, len(p.scopes))

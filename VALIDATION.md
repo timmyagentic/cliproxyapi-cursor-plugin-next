@@ -1,6 +1,55 @@
 # Validation
 
-This document describes the independently maintained 0.1.3 candidate. The exact
+## Native 0.2.0 validation
+
+The native protocol/transport/runtime tests cover real local TLS HTTP/2 duplex,
+HTTP/HTTPS CONNECT and SOCKS proxies, connection reuse, pre-submission fallback,
+blocked writes and cancellation, malformed frames, proto3 default IDs, newer
+scalar updates, batched results, contract mismatch, exact replay, expiry,
+shutdown races and asynchronous accounting. `go test -race ./...`, `go vet ./...`
+and the real shared-library C ABI check passed locally on macOS arm64/Go 1.26.10.
+The workflow also runs the portable, credential-free A/B harness tests.
+
+A small real-provider comparison on 2026-10-27 kept **Grok 4.7, 500K, priority,
+medium reasoning**, the same credential, host/plugin binaries, outbound route,
+8-second accounting budget and zero automatic retries. Each case required four
+actual receipt-verified tools, a correct final answer and an ordinary follow-up
+(six HTTP requests). The Responses case exercised namespace and custom calls.
+
+| Small case | Native sessions | Host stateless |
+| --- | ---: | ---: |
+| Responses entire protocol | 23.49 s | 149.26 s |
+| Responses median first semantic output | 2.05 s | 13.46 s |
+| Chat entire protocol | 27.38 s | 116.27 s |
+| Chat median first semantic output | 1.51 s | 11.77 s |
+| Physical Run IDs in the journal, each case | 2 | 6 |
+
+These are single controlled synthetic samples, not a universal speed guarantee
+or decoder TPS measurement. Native retains one Run for four tool continuations
+and starts another for the ordinary follow-up. Standard native usage is omitted;
+Run measurements belong to the separate journal. The test host is an isolated
+CPA 8.0.43 source build with the proposed usage-presence, stream-unload and auth
+test patches; it is not the installed production service. Full tool-footprint
+and larger-history evidence must be assessed separately.
+
+`integration/native_sessions.py` runs `smoke`, `tools` (33 definitions / 442,107
+bytes) and `stress` (additional synthetic history) against already-started
+isolated listeners. `tools`/`stress` include a custom Lark grammar; validating the
+result packet proves compatibility, not provider-side constrained decoding.
+The default evidence root is `.local-tests/native` in the repository, overridable
+with `CURSOR_NATIVE_TEST_ROOT`. Reports retain timings, hashes and presence-aware
+measurement fields, never credentials or real user transcripts. `compare` checks
+the two arms' environment and workload before comparing them. Both native and
+stateless paths use the same candidate plugin, so this is a whole-path comparison
+of transport plus continuation plus accounting delivery, not a transport-only
+microbenchmark.
+
+For an actual Codex app-server tool probe, `integration/codex_probe.py` accepts
+`--model cursor/grok-4.7@500k --reasoning-effort medium --service-tier priority`.
+Select the existing 500K catalog entry; the helper preserves its context and
+compaction settings. It runs with a private test home and synthetic tools only.
+
+This document describes the independently maintained candidate. The exact
 v0.1.1 import remains in Git history and is identified in `UPSTREAM.json`.
 All checked-in fixtures and example counters are synthetic. Keep live-provider
 credentials, account identifiers, request logs and local evidence outside Git.

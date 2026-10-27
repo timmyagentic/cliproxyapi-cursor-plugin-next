@@ -102,6 +102,12 @@ func publicUsage(usage map[string]any) map[string]any {
 // for the same event, before deciding whether a settled snapshot can be returned.
 // A storage or attribution failure never turns a successful model reply into 503.
 func (p *pluginRuntime) resolveRunUsage(ctx context.Context, s *requestScope, token, account, id string, window usageWindow, policy stepUsagePolicy, deferred bool) (map[string]any, error) {
+	return p.resolveRunUsageWithFetcher(ctx, account, id, window, policy, deferred, func(ctx context.Context, body map[string]any) (map[string]any, error) {
+		return s.json(ctx, http.MethodPost, "/aiserver.v1.DashboardService/GetFilteredUsageEvents", token, body)
+	})
+}
+
+func (p *pluginRuntime) resolveRunUsageWithFetcher(ctx context.Context, account, id string, window usageWindow, policy stepUsagePolicy, deferred bool, fetch usageFetcher) (map[string]any, error) {
 	var observationErr error
 	options := UsageResolveOptions{
 		ExcludeEvent: func(eventID string) bool {
@@ -127,9 +133,7 @@ func (p *pluginRuntime) resolveRunUsage(ctx context.Context, s *requestScope, to
 			}
 		},
 	}
-	usage, err := resolveDashboardUsageWithOptions(ctx, window, func(ctx context.Context, body map[string]any) (map[string]any, error) {
-		return s.json(ctx, http.MethodPost, "/aiserver.v1.DashboardService/GetFilteredUsageEvents", token, body)
-	}, policy, options)
+	usage, err := resolveDashboardUsageWithOptions(ctx, window, fetch, policy, options)
 	if observationErr != nil {
 		return nil, observationErr
 	}
@@ -201,6 +205,12 @@ func (p *pluginRuntime) reconcileUsage(s *requestScope, token, account, current 
 }
 
 func (p *pluginRuntime) reconcileUsageContext(parent context.Context, s *requestScope, token, account, current string) {
+	p.reconcileUsageWithFetcher(parent, account, current, func(ctx context.Context, body map[string]any) (map[string]any, error) {
+		return s.json(ctx, http.MethodPost, "/aiserver.v1.DashboardService/GetFilteredUsageEvents", token, body)
+	})
+}
+
+func (p *pluginRuntime) reconcileUsageWithFetcher(parent context.Context, account, current string, fetch usageFetcher) {
 	p.mu.Lock()
 	if p.reconciling == nil {
 		p.reconciling = make(map[string]bool)
@@ -235,7 +245,7 @@ func (p *pluginRuntime) reconcileUsageContext(parent context.Context, s *request
 		workers.Add(1)
 		go func(record usageRecord) {
 			defer workers.Done()
-			_, err := p.resolveRunUsage(ctx, s, token, account, record.ID, usageWindow{record.Conversation, record.Model, record.Started, record.Ended}, policy, true)
+			_, err := p.resolveRunUsageWithFetcher(ctx, account, record.ID, usageWindow{record.Conversation, record.Model, record.Started, record.Ended}, policy, true, fetch)
 			reason := UsageReasonOf(err)
 			if err != nil {
 				_ = p.journal.MarkUnknown(record.ID, string(reason))

@@ -89,41 +89,81 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 	identity := req
 	identity.AuthID = account
 	cid := conversationID(chat, identity)
-	events := p.run(s, token, resolution, conv, tools, cid, account)
-	first, ok := <-events
-	if !ok {
-		return nil, failure(502, "Cursor returned an empty reply")
+	sessions, release, err := p.nativeForRequest()
+	if err != nil {
+		return nil, err
 	}
-	if first.err != nil && !resolution.Max && maxModeRequired.MatchString(first.err.Error()) {
-		for range events {
+	async := false
+	defer func() {
+		if !async {
+			release()
 		}
-		resolution.Max = true
+	}()
+	var events <-chan runEvent
+	var first runEvent
+	var receipt *nativeReceipt
+	id := "chatcmpl-" + strings.ReplaceAll(randomID(), "-", "")
+	created := p.now().Unix()
+	if sessions != nil {
+		var r nativeReceipt
+		stopOpening := func() {}
+		if stream {
+			stopOpening = s.watchNativeOpening(req.StreamID, id, model, created, time.Second)
+		}
+		events, r, err = sessions.Start(s.ctx, nativeInput{Chat: chat, Model: resolution, Tools: tools, Conversation: conv, CID: cid, OwnerScope: nativeOwnerScope(chat, req, cid), Account: account, Token: token, SourceFormat: nativeSourceFormat(req)})
+		stopOpening()
+		if err != nil {
+			return nil, err
+		}
+		receipt = &r
+	} else {
+		// Do not turn a lost native owner into an unannounced tool replay.
+		for i := len(chat.Messages) - 1; i >= 0 && str(chat.Messages[i]["role"]) == "tool"; i-- {
+			if nativeHandlePattern.MatchString(str(chat.Messages[i]["tool_call_id"])) {
+				return nil, failure(409, "Native Cursor session is unavailable; start a new turn with complete history")
+			}
+		}
 		events = p.run(s, token, resolution, conv, tools, cid, account)
+		var ok bool
 		first, ok = <-events
-	}
-	if !ok {
-		return nil, failure(502, "Cursor returned an empty reply")
-	}
-	if first.err != nil {
-		for range events {
+		if !ok {
+			return nil, failure(502, "Cursor returned an empty reply")
 		}
-		return nil, first.err
+		if first.err != nil && !resolution.Max && maxModeRequired.MatchString(first.err.Error()) {
+			for range events {
+			}
+			resolution.Max = true
+			events = p.run(s, token, resolution, conv, tools, cid, account)
+			first, ok = <-events
+		}
+		if !ok {
+			return nil, failure(502, "Cursor returned an empty reply")
+		}
+		if first.err != nil {
+			for range events {
+			}
+			return nil, first.err
+		}
 	}
 	responseHeaders := http.Header{"Content-Type": {"application/json"}, "X-Cursor-Continuity": {"stateless; bootstrap=imported-history; transport=CPA-host-HTTP"}}
 	responseHeaders.Set("X-Cursor-Usage-Policy", "measured-or-omitted; deferred=separate-journal")
-	id := "chatcmpl-" + strings.ReplaceAll(randomID(), "-", "")
-	created := p.now().Unix()
+	if receipt != nil {
+		responseHeaders.Set("X-Cursor-Continuity", fmt.Sprintf("native; transport=%s; resumed=%t; replay=%t", receipt.Protocol, receipt.Resumed, receipt.Replay))
+		responseHeaders.Set("X-Cursor-Run-Id", receipt.RunID)
+		responseHeaders.Set("X-Cursor-Source-Format", nativeSourceFormat(req))
+	}
 	if stream {
 		responseHeaders.Set("Content-Type", "text/event-stream")
 		responseHeaders.Set("Cache-Control", "no-cache")
-		if err := p.startStreamWorker(func() { streamReply(s, req.StreamID, events, first, id, model, created) }); err != nil {
+		if err := p.startStreamWorker(func() { defer release(); streamReply(s, req.StreamID, events, first, id, model, created, receipt) }); err != nil {
 			return nil, err
 		}
+		async = true
 		return map[string]any{"headers": responseHeaders}, nil
 	}
 	var content, reasoning strings.Builder
 	calls := []any{}
-	stop := "stop"
+	stop := ""
 	var usage map[string]any
 	var accounting map[string]any
 	apply := func(ev runEvent) error {
@@ -138,6 +178,9 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 			calls = append(calls, call)
 		}
 		if ev.stop != "" {
+			if receipt != nil {
+				ev = p.nativeTerminal(*receipt, ev)
+			}
 			stop = ev.stop
 			usage = ev.usage
 			accounting = ev.accounting
@@ -151,6 +194,9 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 		if err = apply(ev); err != nil {
 			return nil, err
 		}
+	}
+	if stop == "" {
+		return nil, failure(502, "Cursor reply ended without a terminal event")
 	}
 	msg := map[string]any{"role": "assistant", "content": content.String()}
 	if reasoning.Len() > 0 {
@@ -166,6 +212,9 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 	if accounting != nil {
 		body["cursor_usage"] = accounting
 	}
+	if receipt != nil && receipt.Delivered != nil {
+		receipt.Delivered()
+	}
 	return map[string]any{"Payload": encodeJSON(body), "Headers": responseHeaders}, nil
 }
 func copyMap(m map[string]any) map[string]any {
@@ -175,17 +224,21 @@ func copyMap(m map[string]any) map[string]any {
 	}
 	return out
 }
-func streamReply(s *requestScope, streamID string, events <-chan runEvent, first runEvent, id, model string, created int64) {
+
+func streamReply(s *requestScope, streamID string, events <-chan runEvent, first runEvent, id, model string, created int64, receipt *nativeReceipt) {
 	defer s.close()
 	closeStream := func(err error) {
 		fields := map[string]any{"stream_id": streamID}
 		if err != nil {
 			fields["error"] = err.Error()
+			fields["error_detail"] = &rpcError{Code: "cursor_error", Message: err.Error(), HTTPStatus: errorStatus(err)}
 		}
 		_ = s.streamCall("host.stream.close", fields, nil)
 	}
 	emit := func(value any) error {
-		return s.streamCall("host.stream.emit", map[string]any{"stream_id": streamID, "payload": append(append([]byte("data: "), encodeJSON(value)...), []byte("\n\n")...)}, nil)
+		// CPA owns SSE framing and its terminal [DONE]. Raw complete JSON works
+		// for both direct Chat and host Responses translation.
+		return s.streamCall("host.stream.emit", map[string]any{"stream_id": streamID, "payload": encodeJSON(value)}, nil)
 	}
 	chunk := func(delta map[string]any, stop any, usage, accounting map[string]any) error {
 		value := map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": stop}}}
@@ -201,6 +254,7 @@ func streamReply(s *requestScope, streamID string, events <-chan runEvent, first
 		closeStream(err)
 		return
 	}
+	sawFinish := false
 	apply := func(ev runEvent) error {
 		switch {
 		case ev.err != nil:
@@ -213,6 +267,10 @@ func streamReply(s *requestScope, streamID string, events <-chan runEvent, first
 		case ev.tool != nil:
 			return chunk(map[string]any{"tool_calls": []any{ev.tool}}, nil, nil, nil)
 		case ev.stop != "":
+			sawFinish = true
+			if receipt != nil {
+				ev = s.p.nativeTerminal(*receipt, ev)
+			}
 			return chunk(map[string]any{}, ev.stop, ev.usage, ev.accounting)
 		}
 		return nil
@@ -221,14 +279,40 @@ func streamReply(s *requestScope, streamID string, events <-chan runEvent, first
 		closeStream(err)
 		return
 	}
-	for ev := range events {
-		if err := apply(ev); err != nil {
-			closeStream(err)
+	ticker := time.NewTicker(nativeHeartbeat)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			closeStream(s.ctx.Err())
 			return
+		case <-ticker.C:
+			// Keep the host cancellation boundary live while Cursor is thinking.
+			// Empty choices carry neither tokens nor fabricated usage.
+			if receipt != nil {
+				if err := emit(map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": []any{}}); err != nil {
+					closeStream(err)
+					return
+				}
+			}
+		case ev, ok := <-events:
+			if !ok {
+				if !sawFinish {
+					closeStream(failure(502, "Cursor reply ended without a terminal event"))
+					return
+				}
+				if receipt != nil && receipt.Delivered != nil {
+					receipt.Delivered()
+				}
+				closeStream(nil)
+				return
+			}
+			if err := apply(ev); err != nil {
+				closeStream(err)
+				return
+			}
 		}
 	}
-	err := s.streamCall("host.stream.emit", map[string]any{"stream_id": streamID, "payload": []byte("data: [DONE]\n\n")}, nil)
-	closeStream(err)
 }
 
 func (p *pluginRuntime) run(s *requestScope, token string, model modelResolution, conv chatConversation, tools []chatTool, cid, account string) <-chan runEvent {

@@ -256,8 +256,8 @@ func TestCursorExecutionUsesHostRunSSEAndBidiAppend(t *testing.T) {
 				if !strings.Contains(string(output), "host-routed reply") {
 					t.Fatalf("missing model reply: %s", output)
 				}
-				if stream && !strings.Contains(string(output), "[DONE]") {
-					t.Fatal("missing stream end")
+				if stream && (!strings.Contains(string(output), `"finish_reason":"stop"`) || strings.Contains(string(output), "data:") || strings.Contains(string(output), "[DONE]")) {
+					t.Fatal("invalid raw executor stream framing")
 				}
 				joined := strings.Join(host.requests, "\n")
 				if !strings.Contains(joined, "RunSSE") || !strings.Contains(joined, "BidiAppend") {

@@ -35,6 +35,15 @@ installing, building, testing and running the native plugin do not.
 The native protocol keeps the upstream MCP namespace `magpie` for wire and
 transcript compatibility. This does not launch or require the magpie app.
 
+Version 0.2.0's native session/transport redesign also references the MIT Cursor
+plugin **0.2.23**, pinned to `magpie-community/plugins` commit
+`9c886c12f92d0da504b9c54cf2dd9df623a61617`, specifically
+`packages/cursor/native-session.mjs`, its tests, and `packages/cursor/index.mjs`.
+Copyright (c) 2026 magpie-community contributors. Its root MIT license is
+identical to the preserved `LICENSE`. The Go implementation adds pooled
+connections and explicit CPA transport selection; it does not use Magpie's
+heuristic allocation of cumulative Run usage to individual model steps.
+
 `assets/cursor.png` is the unmodified `APP_ICON_25D_LIGHT.png` from Cursor's
 official brand asset archive: https://cursor.com/brand (retrieved 2026-10-21).
 Cursor's brand assets remain the property of their respective owner and are

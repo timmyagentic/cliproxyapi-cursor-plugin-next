@@ -51,6 +51,8 @@ def main():
     ap.add_argument("--catalog-slug", required=True, help="existing catalog model; context settings are preserved")
     ap.add_argument("--output", required=True, type=Path, help="new private, isolated test directory")
     ap.add_argument("--large-tools", action="store_true")
+    ap.add_argument("--reasoning-effort", choices=("low", "medium", "high"), default="high")
+    ap.add_argument("--service-tier", choices=("auto", "priority"), help="Explicit isolated CPA payload policy; never changes the user's router")
     ap.add_argument("--timeout", type=int, default=360)
     args = ap.parse_args()
     base = urllib.parse.urlsplit(args.base_url)
@@ -81,8 +83,11 @@ def main():
                 return
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             payload = json.loads(body)
+            if args.service_tier:
+                payload["service_tier"] = args.service_tier
+                body = json.dumps(payload, separators=(",", ":")).encode()
             entry = {"started": time.time(), "request_bytes": len(body), "tool_count": len(payload.get("tools", [])),
-                     "tools_json_bytes": len(json.dumps(payload.get("tools", []), separators=(",", ":")).encode()), "model": payload.get("model")}
+                     "tools_json_bytes": len(json.dumps(payload.get("tools", []), separators=(",", ":")).encode()), "model": payload.get("model"), "reasoning": payload.get("reasoning"), "service_tier": payload.get("service_tier")}
             with request_lock:
                 if len(requests) >= 12:
                     self.send_error(429, "bounded probe request budget exhausted")
@@ -124,7 +129,7 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     config = f'''model = {json.dumps(args.model)}
 model_provider = "accounting-probe"
-model_reasoning_effort = "high"
+model_reasoning_effort = {json.dumps(args.reasoning_effort)}
 model_catalog_json = {json.dumps(str(root/"model-catalog.json"))}
 approval_policy = "never"
 sandbox_mode = "read-only"

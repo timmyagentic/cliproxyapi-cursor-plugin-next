@@ -8,7 +8,13 @@
 
 使用 `make test`、`make build` 构建，macOS 产物为 `dist/cursor-next.dylib`。插件 ID 为 `cursor-next`，provider 仍为 `cursor`。持久化计量需在插件配置里设置 `usage-journal`，目录权限为 0700、文件为 0600；不设置时仅保存在内存中。完整配置见[英文说明](README.md)。
 
-这是 0.1.3 源码/构建候选，不会自动替换现用插件或发布。先按[验证说明](VALIDATION.md)运行独立宿主，再按[安装与回退方案](docs/installation-and-rollback.md)切换。
+这是 0.2.0 源码/构建候选，不会自动替换现用插件或发布。先按[验证说明](VALIDATION.md)运行独立宿主，再按[安装与回退方案](docs/installation-and-rollback.md)切换。
+
+0.2.0 参考 Magpie Cursor 0.2.23 重构原生传输与工具续接：HTTP/2 双向 Run、连接复用、工具结果继续同一次 Run、完整结果批次校验、重复请求回放、超时与取消，以及后台 Run 计量核对。Chat 流改为原始 JSON，由 CPA 统一包装 SSE，修复双重 `data:`。
+
+原生模式需要显式配置 `transport: native` 和 `native-proxy-url: direct` 或批准使用的 HTTP(S)/SOCKS 代理。CPA 插件接口不提供已解析的代理/TLS 策略，因此空配置仍走原有宿主 HTTP。身份交换和模型目录仍使用宿主路径，两者应配置一致。
+
+工具回合不再同步等待账单。整次 Run 的计量保留在独立账本，不伪装成每一步的上下文大小。会话仅保留当前工具轮次；进程重启、过期、历史压缩/变更或不确定的结果提交会明确返回 409。新的普通用户轮次仍会导入完整历史。精确的逐步上下文计量、跨待处理工具回合的自动压缩及非流式即时断连取消仍有边界，详见[原生会话设计](docs/native-sessions.md)。
 
 0.1.3 增加同一事件的初始值、最新值和修订记录；复查也要求稳定采样。
 账本容量、写盘或路径故障会显示降级，不再让成功的模型回答变成 503。
