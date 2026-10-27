@@ -73,6 +73,31 @@ def client(seconds):
     }
 
 
+def presence_record(seconds, unknown=()):
+    row = cpa(seconds)
+    observed = {key: key not in unknown for key in comparison.PRESENCE.values()}
+    row["token_breakdown"]["observed"] = observed
+    row["token_breakdown"]["unclassified_tokens"] = 0
+    if "reasoning_tokens" in unknown:
+        row["tokens"]["reasoning_tokens"] = 0
+        row["token_breakdown"]["output"] = {"total_tokens": 0, "non_reasoning_tokens": 0, "reasoning_tokens": 0}
+        row["token_breakdown"]["unclassified_tokens"] += 9
+    if "cache_read_tokens" in unknown or "cache_write_tokens" in unknown:
+        inp = row["token_breakdown"]["input"]
+        for flag, raw_keys, bucket in (("cache_read_tokens", ("cached_tokens", "cache_read_tokens"), "cache_read_tokens"),
+                                       ("cache_write_tokens", ("cache_creation_tokens",), "cache_write_tokens")):
+            if flag in unknown:
+                for key in raw_keys:
+                    row["tokens"][key] = 0
+                inp[bucket] = 0
+        inp["uncached_tokens"] = 0
+        inp["total_tokens"] = inp["cache_read_tokens"] + inp["cache_write_tokens"]
+        row["token_breakdown"]["unclassified_tokens"] += 200 - inp["total_tokens"]
+    if row["token_breakdown"]["unclassified_tokens"]:
+        row["token_breakdown"]["quality"] = "unclassified"
+    return row
+
+
 class CompareDashboardTests(unittest.TestCase):
     def setUp(self):
         self.records = [journal(0), journal(10)]
@@ -131,6 +156,89 @@ class CompareDashboardTests(unittest.TestCase):
         self.assertIsNone(row["responses"])
         self.assertIn("CPA records unknown as zero with quality=complete", row["limitations"])
 
+    def test_presence_keeps_unknown_reasoning_unclassified(self):
+        record, emitted, upstream = journal(0), client(0), event(1, 0)
+        del record["usage"]["reasoning_tokens"]
+        del upstream["tokenUsage"]["reasoningTokens"]
+        del emitted["usage"]["output_tokens_details"]
+        emitted["usage"]["input_tokens_details"]["cache_write_tokens"] = 20
+        result = comparison.build_report([record], [emitted], [presence_record(0, ("reasoning_tokens",))], [upstream])
+        self.assertTrue(result["passed"], result)
+        row = result["rows"][0]
+        self.assertIsNone(row["cpa_tokens"]["reasoning_tokens"])
+        self.assertEqual(row["cpa_breakdown"]["output_tokens"], 0)
+        self.assertEqual(row["cpa_breakdown"]["unclassified_tokens"], 9)
+
+    def test_unknown_cache_is_not_measured_zero(self):
+        queue = presence_record(0, ("cache_read_tokens", "cache_write_tokens"))
+        tokens = comparison.cpa_counts(queue)
+        self.assertIsNone(tokens["cached_tokens"])
+        self.assertIsNone(tokens["cache_write_tokens"])
+        self.assertIsNone(tokens["uncached_tokens"])
+        self.assertEqual(comparison.breakdown_counts(queue)["unclassified_tokens"], 200)
+
+    def test_presence_all_false_is_unknown_not_measured_zero(self):
+        queue = cpa(0, zero=True)
+        queue["token_breakdown"].update(quality="unclassified", observed={key: False for key in comparison.PRESENCE.values()})
+        result = comparison.build_report([journal(0, internal=1)], [{"started": client(0)["started"], "usage": None}], [queue], [event(1, 0)])
+        self.assertTrue(result["passed"], result)
+        self.assertTrue(all(value is None for value in result["rows"][0]["cpa_tokens"].values()))
+        queue["token_breakdown"]["quality"] = "complete"
+        with self.assertRaisesRegex(ValueError, "quality inconsistent"):
+            comparison.breakdown_counts(queue)
+
+    def test_presence_explicit_zero_remains_complete(self):
+        record, emitted, upstream = journal(0), client(0), event(1, 0)
+        record["usage"] = {key: 0 for key in record["usage"]}
+        upstream["tokenUsage"] = {key: 0 for key in upstream["tokenUsage"]}
+        emitted["usage"] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                            "output_tokens_details": {"reasoning_tokens": 0}}
+        queue = cpa(0, zero=True)
+        queue["token_breakdown"]["observed"] = {key: True for key in comparison.PRESENCE.values()}
+        result = comparison.build_report([record], [emitted], [queue], [upstream])
+        self.assertTrue(result["passed"], result)
+        self.assertTrue(all(value == 0 for value in result["rows"][0]["cpa_tokens"].values()))
+
+    def test_unclassified_total_and_bucket_attribution_stay_strict(self):
+        queue = presence_record(0, ("reasoning_tokens",))
+        queue["token_breakdown"]["unclassified_tokens"] = 8
+        with self.assertRaisesRegex(ValueError, "total inconsistent"):
+            comparison.breakdown_counts(queue)
+        # Keep the grand total conserved, but incorrectly classify unknown output.
+        queue["token_breakdown"]["unclassified_tokens"] = 0
+        queue["token_breakdown"]["output"].update(total_tokens=9, non_reasoning_tokens=9)
+        with self.assertRaisesRegex(ValueError, "observed classifications"):
+            comparison.breakdown_counts(queue)
+
+    def test_unknown_reasoning_cannot_be_published_as_client_zero(self):
+        record, emitted, upstream = journal(0), client(0), event(1, 0)
+        del record["usage"]["reasoning_tokens"]
+        del upstream["tokenUsage"]["reasoningTokens"]
+        emitted["usage"]["output_tokens_details"]["reasoning_tokens"] = 0
+        emitted["usage"]["input_tokens_details"]["cache_write_tokens"] = 20
+        result = comparison.build_report([record], [emitted], [presence_record(0, ("reasoning_tokens",))], [upstream])
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("unknown counter published" in error for error in result["rows"][0]["errors"]))
+
+    def test_revisions_show_first_and_latest_without_rewriting_response(self):
+        record, upstream = journal(0), event(1, 0)
+        record.update(first_usage=copy.deepcopy(record["usage"]), revision=2, provisional=True, source="dashboard")
+        record["event_id"] = comparison.hashlib.sha256(("cursor dashboard event\0" + upstream["usageEventId"]).encode()).hexdigest()
+        record["usage"].update(prompt_tokens=250, total_tokens=259)
+        upstream["tokenUsage"]["inputTokens"] = 130
+        result = comparison.build_report([record], [client(0)], [cpa(0)], [upstream])
+        self.assertTrue(result["passed"], result)
+        row = result["rows"][0]
+        self.assertTrue(row["journal_changed"])
+        self.assertEqual(row["journal_first"]["input_tokens"], 200)
+        self.assertEqual(row["journal_latest"]["input_tokens"], 250)
+        self.assertEqual(row["responses"]["input_tokens"], 200)
+        self.assertTrue(any("emission revision is not recorded" in item for item in row["limitations"]))
+        wrong = client(0)
+        wrong["usage"].update(input_tokens=240, total_tokens=249)
+        self.assertFalse(comparison.build_report([record], [wrong], [cpa(0)], [upstream])["passed"])
+
     def test_cli_numeric_failure_exits_one_and_preserves_report(self):
         queue = copy.deepcopy(self.queue)
         queue[0]["tokens"]["cache_creation_tokens"] = 19
@@ -138,7 +246,7 @@ class CompareDashboardTests(unittest.TestCase):
             root = Path(temporary)
             (root / "journal").mkdir()
             (root / "oauth").mkdir()
-            (root / "journal/usage.json").write_text(json.dumps({"records": self.records}))
+            (root / "journal/usage.json").write_text(json.dumps({"version": 2, "records": self.records}))
             (root / "controlled-summary.json").write_text(json.dumps(self.clients))
             (root / "controlled-usage-queue.json").write_text(json.dumps(queue))
             (root / "oauth/cursor-test.json").write_text(json.dumps({
