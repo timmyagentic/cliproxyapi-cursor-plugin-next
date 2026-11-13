@@ -30,7 +30,7 @@ Cursor Dashboard events have no verified final marker and can change after first
 
 Native continuation is process-local and requires an explicit outbound route
 because CPA does not expose its resolved proxy/custom TLS policy to executors.
-Permanently lost, ended or expired owners return 410 with a stable error code and
+Permanently lost, ended or expired owners return 400 with a stable error code and
 recovery guidance; retrying the same handle cannot recreate it. Busy/in-flight
 or correctable contract conflicts remain 409. A new ordinary user turn imports
 full history; inspect completed tool side effects first. Exact per-step context
@@ -128,7 +128,7 @@ provided by the host) retains `journal`, `active_runs` and `version`, and adds:
   unstamped ad hoc build reports `unknown`/`null` rather than the current checkout.
 - `contract`: observations are Run totals, per-inference context is unavailable,
   missing is not zero, stable is not final, and late updates stay in the journal.
-  It also reports effective transport, active native limits and the 410/new-user-turn
+  It also reports effective transport, active native limits and the 400/new-user-turn
   recovery rule without exposing the proxy URL.
 - `summary`: counts by measurement presence, status, source and failure reason,
   plus the latest measured Run's counters and revision. The scope is only the

@@ -46,8 +46,8 @@ func (e *nativeRecoveryError) Error() string {
 
 func (e *nativeRecoveryError) Unwrap() error { return e.err }
 
-// The stable subtype is always present in Error(). For local permanent handle
-// failures, pluginErrorDetail reserves the ABI code for host request scoping.
+// The stable subtype is present in both Error() and the C ABI code field,
+// because a host may discard structured extension fields.
 func nativeErrorCode(err error) string {
 	var detail *nativeRecoveryError
 	if errors.As(err, &detail) {
@@ -106,10 +106,10 @@ func nativeContinuationFailure(code, reason, message string) error {
 	return nativeRecoveryRequired(nativeFailure(409, code, reason, message))
 }
 
-// Gone distinguishes an irrecoverable handle from an in-flight 409 conflict.
-// Retrying the same HTTP request cannot recreate an execution owner safely.
+// An irrecoverable continuation is invalid request input, not an account fault.
+// Codex 0.167 retries 410 but stops on 400; retrying cannot recreate this owner.
 func nativePermanentFailure(code, reason, message string) error {
-	return nativeRecoveryRequired(nativeFailure(410, code, reason, message))
+	return nativeRecoveryRequired(nativeFailure(400, code, reason, message))
 }
 
 func nativeUncertainSubmission(err error, message string) error {

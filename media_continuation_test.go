@@ -112,7 +112,7 @@ func TestExecutorNativeContinuationDoesNotRefetchExpiredHistoricalImages(t *test
 	unknownResult["tool_call_id"] = unknownID
 	unknown := []map[string]any{user, unknownAssistant, unknownResult}
 	response := execute(p, unknown)
-	if num(object(response["error"])["http_status"]) != 410 || fetches.Load() != 1 {
+	if num(object(response["error"])["http_status"]) != 400 || fetches.Load() != 1 {
 		t.Fatalf("unknown handle was masked by historical media preparation: %v, fetches=%d", response, fetches.Load())
 	}
 
@@ -149,7 +149,7 @@ func TestExecutorNativeContinuationDoesNotRefetchExpiredHistoricalImages(t *test
 		t.Fatal("host mode silently skipped unsupported history media")
 	}
 	response = execute(stateless, unknown)
-	if num(object(response["error"])["http_status"]) != 410 || fetches.Load() != 2 {
+	if num(object(response["error"])["http_status"]) != 400 || fetches.Load() != 2 {
 		t.Fatal("lost native owner was replayed/prepared as a host-mode request")
 	}
 }

@@ -99,7 +99,7 @@ func TestNativeNearDeadlineDoesNotPublishUnusableTools(t *testing.T) {
 		}
 	}
 	last := out[len(out)-1].err
-	if nativeErrorCode(last) != "cursor_native_deadline" || errorStatus(last) != 410 || !strings.Contains(last.Error(), "no new tool batch was delivered") {
+	if nativeErrorCode(last) != "cursor_native_deadline" || errorStatus(last) != 400 || !strings.Contains(last.Error(), "no new tool batch was delivered") {
 		t.Fatalf("near-deadline rejection lacks its recovery reason: %v", last)
 	}
 }
@@ -113,7 +113,7 @@ func TestNativeExpiryDuringOpenPreservesPermanentDeadline(t *testing.T) {
 	defer ns.Close()
 	ns.limits.Lifetime = 25 * time.Millisecond
 	_, _, err := ns.Start(context.Background(), nativeTestInput())
-	if errorStatus(err) != 410 || nativeErrorCode(err) != "cursor_native_deadline" || !strings.Contains(err.Error(), "run_lifetime") {
+	if errorStatus(err) != 400 || nativeErrorCode(err) != "cursor_native_deadline" || !strings.Contains(err.Error(), "run_lifetime") {
 		t.Fatalf("late Open replaced the original permanent deadline: %v", err)
 	}
 	if tr.closed.Load() != 1 {

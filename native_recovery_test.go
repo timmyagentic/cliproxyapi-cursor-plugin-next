@@ -42,7 +42,7 @@ func TestNativeFirstFailureABIIsSanitizedAndClassified(t *testing.T) {
 	}
 }
 
-func TestNativeRequestScopedMappingIsLimitedToPermanentLocalHandles(t *testing.T) {
+func TestNativePermanentHandlesUseNonRetriableRequestStatus(t *testing.T) {
 	transport := nativeSafeError(context.Background(), "stream read", io.EOF)
 	for _, err := range []error{
 		nativePermanentFailure("cursor_native_owner_unavailable", "owner_not_retained", "native owner is unavailable"),
@@ -50,7 +50,7 @@ func TestNativeRequestScopedMappingIsLimitedToPermanentLocalHandles(t *testing.T
 		nativePermanentFailure("cursor_native_deadline", "tool_result_timeout", "native tool-result deadline expired"),
 	} {
 		detail := pluginErrorDetail(err)
-		if detail.Code != "request_scoped" || detail.HTTPStatus != 410 || detail.RetryAfterSeconds != 0 {
+		if detail.Code != nativeErrorCode(err) || detail.HTTPStatus != 400 || detail.RetryAfterSeconds != 0 {
 			t.Fatalf("permanent local failure could penalize the credential: %+v", detail)
 		}
 		if !strings.Contains(detail.Message, "code="+nativeErrorCode(err)) || !strings.Contains(detail.Message, "retry_same_request=false") {
@@ -73,7 +73,7 @@ func TestNativeRequestScopedMappingIsLimitedToPermanentLocalHandles(t *testing.T
 	} {
 		detail := pluginErrorDetail(tc.err)
 		if detail.Code != tc.code || detail.HTTPStatus != tc.status || detail.RetryAfterSeconds != tc.retryAfter {
-			t.Fatalf("local 410 fix changed unrelated error routing: %+v", detail)
+			t.Fatalf("local continuation fix changed unrelated error routing: %+v", detail)
 		}
 	}
 }
@@ -108,7 +108,7 @@ func TestNativeCompletedResultsDoNotAuthorizeRebuildingAnUncertainRun(t *testing
 	}
 	for range 3 {
 		_, _, err = ns.Start(context.Background(), next)
-		if nativeErrorCode(err) != "cursor_native_owner_lost" || errorStatus(err) != 410 || retryAfterSeconds(err) != 0 {
+		if nativeErrorCode(err) != "cursor_native_owner_lost" || errorStatus(err) != 400 || retryAfterSeconds(err) != 0 {
 			t.Fatalf("lost-owner result is not distinguishable/non-retryable: %v", err)
 		}
 		for _, want := range []string{"original_failure=cursor_native_submission_uncertain", "write/unexpected_eof", "retry_same_request=false", "new user turn"} {
@@ -129,7 +129,7 @@ func TestNativeCompletedResultsDoNotAuthorizeRebuildingAnUncertainRun(t *testing
 		foreign := next
 		foreign.Account, foreign.OwnerScope = other.account, other.scope
 		_, _, err = ns.Start(context.Background(), foreign)
-		if nativeErrorCode(err) != "cursor_native_owner_unavailable" || errorStatus(err) != 410 || strings.Contains(err.Error(), "original_failure=") {
+		if nativeErrorCode(err) != "cursor_native_owner_unavailable" || errorStatus(err) != 400 || strings.Contains(err.Error(), "original_failure=") {
 			t.Fatal("retired-owner diagnostics crossed an account/caller boundary")
 		}
 	}
@@ -143,7 +143,7 @@ func TestNativeRestartRequiresANewUserTurnEvenWithCompleteResults(t *testing.T) 
 	}
 	restarted, replacement, opens := nativeTestPool(t)
 	_, _, err := restarted.Start(context.Background(), next)
-	if nativeErrorCode(err) != "cursor_native_owner_unavailable" || errorStatus(err) != 410 || !strings.Contains(err.Error(), "new user turn") || opens.Load() != 0 {
+	if nativeErrorCode(err) != "cursor_native_owner_unavailable" || errorStatus(err) != 400 || !strings.Contains(err.Error(), "new user turn") || opens.Load() != 0 {
 		t.Fatalf("restart silently imported stale tool results: %v", err)
 	}
 	// An explicit new user turn can import the known history. It is a fresh Run,
@@ -214,7 +214,7 @@ func TestNativeCancelledAndExpiredOwnersRetainTheirCause(t *testing.T) {
 			}
 			nativeWait(t, func() bool { return tr.closed.Load() == 1 && !ns.Busy() })
 			_, _, err := ns.Start(context.Background(), next)
-			if nativeErrorCode(err) != "cursor_native_owner_lost" || errorStatus(err) != 410 || !strings.Contains(err.Error(), want) || opens.Load() != 1 {
+			if nativeErrorCode(err) != "cursor_native_owner_lost" || errorStatus(err) != 400 || !strings.Contains(err.Error(), want) || opens.Load() != 1 {
 				t.Fatalf("lost cancellation/expiry cause: %v", err)
 			}
 		})

@@ -117,20 +117,19 @@ does not replay a write or change global cooldown configuration; older hosts
 may ignore the optional ABI field.
 
 Permanently expired, ended or missing owners, including handles from before a
-restart, return **410 Gone** rather than a retryable busy conflict. The error
+restart, return **400 Bad Request** rather than a retryable busy conflict. The error
 message includes a stable `cursor_native_*` subtype, a bounded reason and
 `retry_same_request=false`. Busy/in-flight or correctable contract conflicts
 remain 409; a first transport failure retains its original 502/504 status.
 An uncertain write is never silently replayed into a different native exec.
 
-For those local 410 failures, the C ABI error code is `request_scoped`. On the
-verified CPA **8.0.63** host this preserves HTTP 410 while keeping the credential
-available for the next valid request; an unclassified 410 instead cooled the
-credential. The native subtype stays in the message. Real upstream, transport,
-authentication and quota errors retain their existing classification. This
-availability behavior has not been verified on the older 8.0.38/8.0.43 hosts.
-Generic host/client retry behavior must be checked on the actual versions; a
-machine code alone is not proof that the client stops retrying.
+This status is intentional: a synthetic comparison with the actual Codex
+**0.167.0-alpha.4.1** app-server and default retry settings sent the same recovery
+error once with HTTP 400, but six times with HTTP 410. CPA **8.0.63** also kept
+the account available after 400 without a special ABI scope code. The stable
+native subtype remains in the C ABI code and message. Real upstream, transport,
+authentication and quota errors retain their existing classification. These
+host/client observations are version-specific, not a universal retry promise.
 
 A new user turn with complete history starts a fresh Run. Inspect completed
 tool side effects before continuing, because a missing execution owner does not

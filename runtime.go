@@ -78,20 +78,10 @@ func errorEnvelope(err error) []byte {
 
 func pluginErrorDetail(err error) *rpcError {
 	code := nativeErrorCode(err)
-	status := errorStatus(err)
-	if status == 410 {
-		switch code {
-		case "cursor_native_owner_lost", "cursor_native_owner_unavailable", "cursor_native_deadline":
-			// CPA 8.0.63 treats an unclassified 410 as an auth failure. These
-			// local handle failures belong only to this request; their stable
-			// native subtype remains in Message for clients and diagnostics.
-			code = "request_scoped"
-		}
-	}
 	if code == "" {
 		code = "cursor_error"
 	}
-	return &rpcError{Code: code, Message: err.Error(), HTTPStatus: status, RetryAfterSeconds: retryAfterSeconds(err)}
+	return &rpcError{Code: code, Message: err.Error(), HTTPStatus: errorStatus(err), RetryAfterSeconds: retryAfterSeconds(err)}
 }
 
 type rpcRequest struct {

@@ -106,7 +106,7 @@ func TestAccountingDiagnosticsReportsEffectiveNativeLimitsWithoutProxy(t *testin
 		t.Fatal(err)
 	}
 	value := p.accountingDiagnostics()
-	if value.Contract.EffectiveTransport != "native" || value.Contract.NativeLimits == nil || value.Contract.NativeLimits.ToolResultTimeoutSeconds != 90 || value.Contract.NativeLimits.RunLifetimeSeconds != 600 || value.Contract.PermanentNativeHandleStatus != 410 {
+	if value.Contract.EffectiveTransport != "native" || value.Contract.NativeLimits == nil || value.Contract.NativeLimits.ToolResultTimeoutSeconds != 90 || value.Contract.NativeLimits.RunLifetimeSeconds != 600 || value.Contract.PermanentNativeHandleStatus != 400 {
 		t.Fatalf("effective limits/recovery contract missing: %+v", value.Contract)
 	}
 	encoded := string(encodeJSON(value))

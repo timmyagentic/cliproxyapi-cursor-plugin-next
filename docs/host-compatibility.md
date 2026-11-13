@@ -51,31 +51,26 @@ The plugin's bounded authenticated accounting diagnostics remain independent
 of the standard Responses fields: Run measurements and unknown context are
 reported separately, and no companion core/desktop feed is required.
 
-## Request-local failures on CPA 8.0.63
+## Permanent continuation errors on the current host/client
 
-A separate synthetic C ABI probe on the installed **8.0.63** host checked each
-error followed by the same invalid request and then a valid request. An ordinary
-410 carrying a provider-specific code produced `410, 503, 503`: CPA cooled the
-credential after the first error. Using the existing ABI code `request_scoped`
-produced `410, 410, 200`, with all three requests reaching the fixture. Both
-nonstream and stream-opening errors passed; a late `host.stream.close` error
-also left the next valid request available. No provider request or global
-cooldown setting was used.
+Local missing, ended or expired native handles return **400 Bad Request** with
+their existing `cursor_native_*` code and new-user-turn recovery text. The
+request cannot be resumed safely; it does not imply an account failure.
 
-The plugin therefore marks only its local `owner_unavailable`, `owner_lost` and
-`deadline` failures with HTTP 410 as `request_scoped`. Their stable
-`cursor_native_*` subtype and recovery action remain in the message. An actual
-upstream HTTP 410 keeps its upstream classification. Ordinary input 400,
-contract-conflict 409 and size-limit 413 were already availability-neutral on
-this host. Authentication 401 and quota 429 still blocked subsequent execution;
-a real-transport 502 fixture retained its two-second cooldown and recovered
-after the wait.
+A synthetic C ABI probe on CPA **8.0.63** sent an invalid request, repeated it,
+then sent a valid request. HTTP 400 produced `400, 400, 200` on synchronous and
+stream-opening paths, without cooling the account. Contract-conflict 409 and
+size-limit 413 were also availability-neutral. Authentication 401 and quota 429
+still blocked execution; transport 502 retained its two-second cooldown.
 
-An explicit zero or negative `retry_after_seconds` did not prevent the 410
-cooldown: this host treats nonpositive plugin retry hints as absent. The
-`request_scoped` availability behavior above is verified only on **8.0.63**;
-it has not been extrapolated to the older 8.0.38/8.0.43 hosts or to generic
-client retry behavior.
+The actual Codex **0.167.0-alpha.4.1** app-server, with default retry settings and
+the same synthetic recovery JSON, made one request for HTTP 400 (0.650 seconds)
+and six for HTTP 410 (7.212 seconds). This comparison used loopback only, without
+a provider call. It explains the chosen 400 contract. A `request_scoped` ABI
+code can prevent CPA's 410 account cooldown, but does not stop that client retry
+loop; the plugin does not need that special mapping for its local 400 errors.
+Upstream HTTP statuses keep their original classification. These observations
+have not been extrapolated to other host/client versions.
 
 ## Separate host patch tested against 8.0.43
 

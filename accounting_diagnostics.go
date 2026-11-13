@@ -74,7 +74,7 @@ func (p *pluginRuntime) accountingDiagnostics() accountingManagementResponse {
 			MeasurementScope: "run", PerInferenceContext: "unavailable",
 			MissingMeansZero: false, StableMeansFinal: false, LateUpdates: "journal_only",
 			EffectiveTransport: transport, NativeLimits: limits,
-			PermanentNativeHandleStatus: 410, PermanentNativeHandleRecovery: "new_user_turn_with_full_history_verify_tool_side_effects",
+			PermanentNativeHandleStatus: 400, PermanentNativeHandleRecovery: "new_user_turn_with_full_history_verify_tool_side_effects",
 		},
 		Summary: summary,
 	}
