@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Cursor 用量</title>
+  <style>
+    :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #243044; background: #f7f9fc; font-size: 14px; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 28px 28px 48px; }
+    main { max-width: 1600px; margin: 0 auto; }
+    h1 { margin: 0; font-size: 24px; font-weight: 650; letter-spacing: -.4px; }
+    p { margin: 8px 0; line-height: 1.6; }
+    .muted, .detail { color: #69778b; }
+    .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 24px 0 12px; flex-wrap: wrap; }
+    .controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    select, input, button { font: inherit; border: 1px solid #d9e1ec; border-radius: 6px; padding: 8px 12px; background: #fff; color: inherit; }
+    button { cursor: pointer; transition: background-color 120ms ease; }
+    button:hover { background: #eef3fa; }
+    button:disabled { cursor: wait; opacity: .55; }
+    :focus-visible { outline: 2px solid #527db8; outline-offset: 2px; }
+    #auth-form { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 18px 0; padding: 14px 0; border-block: 1px solid #dfe6ef; }
+    #auth-form[hidden], [hidden] { display: none !important; }
+    #management-key { width: 280px; max-width: 100%; }
+    #status { margin: 0; font-size: 13px; color: #69778b; }
+    #status.error, #journal-note { color: #8c5b22; }
+    #summary { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px 24px; padding: 14px 0 17px; font-size: 13px; }
+    #summary strong { margin-left: 7px; font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .table-wrap { overflow-x: auto; border: 1px solid #e1e7ef; border-radius: 8px; background: #fff; }
+    table { border-collapse: collapse; width: 100%; min-width: 1160px; font-size: 13px; }
+    caption { text-align: left; padding: 12px 15px; color: #69778b; font-size: 12px; border-bottom: 1px solid #e8edf3; }
+    th { background: #f3f6fa; color: #5a687c; font-weight: 600; text-align: left; white-space: nowrap; padding: 12px 14px; }
+    td { border-top: 1px solid #edf0f5; padding: 13px 14px; vertical-align: top; }
+    tbody tr:hover { background: #f9fbfe; }
+    .number { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .time { white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .model { min-width: 150px; max-width: 230px; overflow-wrap: anywhere; font-weight: 500; }
+    .detail { display: block; font-size: 11px; line-height: 1.5; margin-top: 3px; font-weight: 400; }
+    .observation { white-space: nowrap; }
+    .empty { text-align: center; padding: 48px 16px; color: #69778b; }
+    .notes { margin-top: 14px; font-size: 12px; color: #69778b; }
+    .notes p { margin: 4px 0; }
+    a { color: #346aa7; text-underline-offset: 3px; }
+    @media (max-width: 700px) { body { padding: 20px 14px 40px; } .toolbar { align-items: flex-start; gap: 12px; } #summary { gap: 8px 18px; } }
+    @media (prefers-reduced-motion: reduce) { button { transition: none; } }
+  </style>
+</head>
+<body>
+<main id="usage-page" data-endpoint="{{.Endpoint}}">
+  <h1>Cursor 用量</h1>
+  <p class="muted">每行对应整次 Run，可跨多个 HTTP 请求与模型调用；观测值可能随后修订。</p>
+
+  <form id="auth-form" hidden autocomplete="off">
+    <label for="management-key">CPA 管理密钥</label>
+    <input id="management-key" type="password" autocomplete="off" spellcheck="false" required>
+    <button type="submit" id="connect">读取用量</button>
+    <span class="muted">仅用于当前页面，不保存。</span>
+  </form>
+
+  <div class="toolbar">
+    <div class="controls">
+      <label for="period">时间范围</label>
+      <select id="period">
+        <option value="24">最近 24 小时</option>
+        <option value="168">最近 7 天</option>
+        <option value="all">已载入全部</option>
+      </select>
+      <button id="refresh" type="button">刷新</button>
+    </div>
+    <p id="status" role="status" aria-live="polite">正在连接…</p>
+  </div>
+
+  <div id="summary" aria-live="polite"></div>
+  <div class="table-wrap" tabindex="0" role="region" aria-label="整次 Run 用量表，可横向滚动">
+    <table>
+      <caption id="scope-note">读取当前日志中最近的 Run，筛选范围仅限已载入记录。</caption>
+      <thead>
+        <tr>
+          <th scope="col">Run 开始时间</th>
+          <th scope="col">模型</th>
+          <th scope="col" class="number">输入<span class="detail">含缓存</span></th>
+          <th scope="col" class="number">输出<span class="detail">含已报告推理</span></th>
+          <th scope="col" class="number">缓存<span class="detail">输入的子集</span></th>
+          <th scope="col" class="number">推理<span class="detail">输出的子集</span></th>
+          <th scope="col" class="number">整轮耗时</th>
+          <th scope="col" class="number">整轮平均吞吐<span class="detail">输出 token/s</span></th>
+          <th scope="col" class="number">估算费用<span class="detail">USD</span></th>
+          <th scope="col">观测状态</th>
+        </tr>
+      </thead>
+      <tbody id="rows"><tr><td class="empty" colspan="10">正在读取…</td></tr></tbody>
+    </table>
+  </div>
+  <div class="notes">
+    <p id="journal-note" hidden></p>
+    <p>汇总只计算当前可见的已测量行；未知不按 0 计。缓存与推理不另加到输入、输出总量。</p>
+    <p>整轮平均吞吐包含工具、网络及等待耗时，不代表模型生成速度。费用为按 <a href="https://cursor.com/docs/models/grok-4-7" target="_blank" rel="noopener noreferrer">Cursor 公布价格</a>估算，区间表示单次推理的上下文档位不可见，不代表已扣款。</p>
+  </div>
+</main>
+<script>
+(() => {
+  'use strict';
+  const byID = (id) => document.getElementById(id);
+  const form = byID('auth-form');
+  const keyInput = byID('management-key');
+  const period = byID('period');
+  const refresh = byID('refresh');
+  const status = byID('status');
+  const rows = byID('rows');
+  const numberFormat = new Intl.NumberFormat('zh-CN');
+  let snapshot = null;
+  let loadedAt = null;
+  let managementKey = '';
+  let loading = false;
+
+  // The desktop's existing same-origin bridge supplies this key. Read only;
+  // never copy it into the DOM, logs, another storage key, or a URL.
+  function bridgeKey() {
+    try {
+      const auth = JSON.parse(localStorage.getItem('cli-proxy-auth'));
+      return typeof auth?.state?.managementKey === 'string' ? auth.state.managementKey.trim() : '';
+    } catch { return ''; }
+  }
+
+  const known = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+  const tokens = (value) => known(value) ? numberFormat.format(value) : '未知';
+  const money = (value) => known(value) ? '$' + value.toLocaleString('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 6 }) : '未知';
+  const validDate = (value) => typeof value === 'string' && Number.isFinite(Date.parse(value));
+  function duration(value) {
+    if (!known(value)) return '未知';
+    if (value < 1000) return value.toLocaleString('zh-CN', { maximumFractionDigits: 0 }) + ' ms';
+    return (value / 1000).toLocaleString('zh-CN', { maximumFractionDigits: 1 }) + ' s';
+  }
+  function estimateKnown(estimate) {
+    return estimate && ['estimated', 'range'].includes(estimate.status) && known(estimate.low_usd) && known(estimate.high_usd) && estimate.high_usd >= estimate.low_usd;
+  }
+  function estimateText(estimate) {
+    if (!estimateKnown(estimate)) return '未知';
+    return estimate.status === 'range' && estimate.low_usd !== estimate.high_usd
+      ? money(estimate.low_usd) + ' – ' + money(estimate.high_usd)
+      : money(estimate.low_usd);
+  }
+  function estimateDetail(estimate) {
+    return ({
+      usage_unavailable: '用量尚未观测',
+      invalid_usage: '用量无法用于估算',
+      model_price_unavailable: '暂无该模型价格',
+      cache_write_price_unavailable: '缓存写入价格未知',
+      run_input_within_short_context_limit: '按公布价格估算',
+      per_step_context_unknown: '上下文档位区间'
+    })[estimate?.reason] || '暂无可用估算';
+  }
+  function cell(row, text, className, detail) {
+    const td = document.createElement('td');
+    td.className = className || '';
+    td.textContent = text;
+    if (detail) {
+      const small = document.createElement('span');
+      small.className = 'detail';
+      small.textContent = detail;
+      td.append(small);
+    }
+    row.append(td);
+    return td;
+  }
+  function empty(message) {
+    const row = document.createElement('tr');
+    const td = cell(row, message, 'empty');
+    td.colSpan = 10;
+    rows.replaceChildren(row);
+  }
+  function metric(label, value) {
+    const item = document.createElement('span');
+    item.textContent = label;
+    const strong = document.createElement('strong');
+    strong.textContent = value;
+    item.append(strong);
+    byID('summary').append(item);
+  }
+  function observation(row) {
+    if (!row.usage) return ({ running: '运行中', pending: '待观测', unknown: '未知' })[row.status] || '未知';
+    return row.status === 'deferred' ? '延迟观测' : '已测量';
+  }
+  function render() {
+    byID('summary').replaceChildren();
+    if (!snapshot) {
+      byID('scope-note').textContent = '读取当前日志中最近的 Run，筛选范围仅限已载入记录。';
+      byID('journal-note').hidden = true;
+      empty(form.hidden ? '正在读取…' : '输入 CPA 管理密钥后读取用量。');
+      return;
+    }
+    const cutoff = period.value === 'all' ? null : Date.now() - Number(period.value) * 3600000;
+    const visible = snapshot.rows.filter((row) => cutoff === null || (validDate(row.started) && Date.parse(row.started) >= cutoff));
+    const measured = visible.filter((row) => row.usage && typeof row.usage === 'object');
+    const sum = (name) => measured.length && measured.every((row) => known(row.usage[name]))
+      ? tokens(measured.reduce((total, row) => total + row.usage[name], 0)) : '未知';
+    const priced = measured.filter((row) => estimateKnown(row.estimate));
+    let cost = '未知';
+    if (priced.length) {
+      const low = priced.reduce((total, row) => total + row.estimate.low_usd, 0);
+      const high = priced.reduce((total, row) => total + row.estimate.high_usd, 0);
+      cost = low === high ? money(low) : money(low) + ' – ' + money(high);
+    }
+    metric('显示', visible.length + ' 轮');
+    metric('已测量', measured.length + ' 轮');
+    metric('输入', sum('prompt_tokens'));
+    metric('输出', sum('completion_tokens'));
+    metric('缓存读取', sum('cached_tokens'));
+    metric('估算费用（' + priced.length + '/' + measured.length + ' 轮）', cost);
+    const count = known(snapshot.total_active_records) ? snapshot.total_active_records : snapshot.rows.length;
+    const limit = known(snapshot.limit) ? snapshot.limit : snapshot.rows.length;
+    byID('scope-note').textContent = '已载入 ' + snapshot.rows.length + ' / 当前日志 ' + count + ' 轮，最多载入最近 ' + limit + ' 轮。时间筛选按 Run 开始时间。';
+    const journal = snapshot.journal || {};
+    const unhealthy = journal.state && !['healthy', 'memory'].includes(journal.state);
+    byID('journal-note').hidden = !unhealthy && !journal.attribution_incomplete;
+    byID('journal-note').textContent = '日志当前存在保存或归属缺口，以下仅反映仍可读取的观测记录。';
+    if (!visible.length) { empty('当前范围没有已载入的 Run。'); return; }
+    const fragment = document.createDocumentFragment();
+    for (const row of visible) {
+      const tr = document.createElement('tr');
+      const started = validDate(row.started) ? new Date(row.started) : null;
+      const timeCell = cell(tr, started ? started.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' }) : '未知', 'time', started ? started.toLocaleTimeString('zh-CN', { hour12: false }) : '');
+      if (started) timeCell.title = started.toLocaleString('zh-CN', { hour12: false });
+      cell(tr, typeof row.model === 'string' ? row.model : '未知', 'model');
+      const usage = row.usage || {};
+      cell(tr, tokens(usage.prompt_tokens), 'number');
+      cell(tr, tokens(usage.completion_tokens), 'number');
+      cell(tr, tokens(usage.cached_tokens), 'number', known(usage.cache_write_tokens) && usage.cache_write_tokens > 0 ? '写入 ' + tokens(usage.cache_write_tokens) : '');
+      cell(tr, tokens(usage.reasoning_tokens), 'number');
+      cell(tr, duration(row.duration_ms), 'number');
+      cell(tr, known(row.throughput_tokens_per_second) ? row.throughput_tokens_per_second.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '未知', 'number');
+      cell(tr, estimateText(row.estimate), 'number', estimateDetail(row.estimate));
+      const source = ({ dashboard: 'Cursor Dashboard', turn_ended: 'Run 结束事件' })[row.source] || '';
+      cell(tr, observation(row), 'observation', [source, row.usage && row.provisional ? '可能修订' : ''].filter(Boolean).join(' · '));
+      fragment.append(tr);
+    }
+    rows.replaceChildren(fragment);
+  }
+  async function load() {
+    if (loading) return;
+    if (!managementKey) {
+      form.hidden = false;
+      status.textContent = '需要 CPA 管理密钥。';
+      render();
+      return;
+    }
+    loading = true;
+    refresh.disabled = true;
+    byID('connect').disabled = true;
+    status.className = '';
+    status.textContent = '正在刷新…';
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    try {
+      const endpoint = new URL(byID('usage-page').dataset.endpoint, location.href);
+      if (endpoint.origin !== location.origin) throw new Error('Invalid origin');
+      const response = await fetch(endpoint.href, {
+        method: 'GET', credentials: 'same-origin', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer', signal: controller.signal,
+        headers: { 'Authorization': 'Bearer ' + managementKey, 'Accept': 'application/json' }
+      });
+      if (response.status === 401 || response.status === 403) {
+        managementKey = '';
+        snapshot = null;
+        loadedAt = null;
+        form.hidden = false;
+        status.className = 'error';
+        status.textContent = '认证失败，请输入有效的 CPA 管理密钥。';
+        render();
+        return;
+      }
+      if (!response.ok) throw new Error('Request failed');
+      const value = await response.json();
+      if (!value || value.scope !== 'run' || !Array.isArray(value.rows)) throw new Error('Invalid response');
+      snapshot = value;
+      loadedAt = new Date();
+      form.hidden = true;
+      status.textContent = '更新于 ' + loadedAt.toLocaleTimeString('zh-CN', { hour12: false });
+      render();
+    } catch {
+      status.className = 'error';
+      status.textContent = loadedAt
+        ? '刷新失败，显示 ' + loadedAt.toLocaleTimeString('zh-CN', { hour12: false }) + ' 的记录。'
+        : '读取失败，请检查 CPA 服务后刷新。';
+      if (!snapshot) empty('暂时无法读取用量。');
+    } finally {
+      clearTimeout(timeout);
+      loading = false;
+      refresh.disabled = false;
+      byID('connect').disabled = false;
+    }
+  }
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    managementKey = keyInput.value.trim();
+    keyInput.value = '';
+    load();
+  });
+  period.addEventListener('change', render);
+  refresh.addEventListener('click', load);
+  managementKey = bridgeKey();
+  load();
+})();
+</script>
+</body>
+</html>

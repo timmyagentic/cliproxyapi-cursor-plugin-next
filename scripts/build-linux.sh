@@ -10,8 +10,7 @@ if [[ ! -x "$BUILD_PYTHON" ]]; then
   exit 1
 fi
 
-CGO_ENABLED=1 go build -buildvcs=false -trimpath -buildmode=c-shared \
-  -o dist/cursor-next.so .
+"$BUILD_PYTHON" scripts/release.py build --library dist/cursor-next.so
 
 "$BUILD_PYTHON" - <<'PY'
 import re

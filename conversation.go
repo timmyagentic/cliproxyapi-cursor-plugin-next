@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -15,19 +14,24 @@ const dynamicCall = "CallDynamicTool"
 const missingToolResult = "Tool use was interrupted and did not produce a result."
 
 type chatRequest struct {
-	Model           string           `json:"model"`
-	Messages        []map[string]any `json:"messages"`
-	Tools           []map[string]any `json:"tools"`
-	ToolChoice      any              `json:"tool_choice"`
-	ReasoningEffort string           `json:"reasoning_effort"`
-	ServiceTier     string           `json:"service_tier"`
-	PromptCacheKey  string           `json:"prompt_cache_key"`
-	toolSchemas     []string
+	Model             string           `json:"model"`
+	Messages          []map[string]any `json:"messages"`
+	Tools             []map[string]any `json:"tools"`
+	ToolChoice        any              `json:"tool_choice"`
+	ReasoningEffort   string           `json:"reasoning_effort"`
+	ServiceTier       string           `json:"service_tier"`
+	PromptCacheKey    string           `json:"prompt_cache_key"`
+	ParallelToolCalls *bool            `json:"parallel_tool_calls"`
+	toolSchemas       []string
+	rawFields         map[string]json.RawMessage
 }
 
 func (c *chatRequest) UnmarshalJSON(raw []byte) error {
 	type alias chatRequest
 	if err := json.Unmarshal(raw, (*alias)(c)); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(raw, &c.rawFields); err != nil {
 		return err
 	}
 	var source struct {
@@ -56,6 +60,8 @@ type chatTool struct {
 	Name, Description string
 	Schema            map[string]any
 	SchemaText        string
+	Strict            bool
+	validator         argumentValidator
 }
 type chatConversation struct {
 	Messages [][]byte
@@ -104,7 +110,8 @@ func toolsOf(chat chatRequest) []chatTool {
 		if i < len(chat.toolSchemas) && chat.toolSchemas[i] != "" {
 			schemaText = chat.toolSchemas[i]
 		}
-		tools = append(tools, chatTool{Name: name, Description: str(f["description"]), Schema: schema, SchemaText: schemaText})
+		strict, _ := f["strict"].(bool)
+		tools = append(tools, chatTool{Name: name, Description: str(f["description"]), Schema: schema, SchemaText: schemaText, Strict: strict})
 	}
 	return tools
 }
@@ -166,14 +173,28 @@ func toolResult(id, text string, isError bool) map[string]any {
 	}
 	return out
 }
-func conversation(chat chatRequest, tools []chatTool) (chatConversation, error) {
+func conversation(chat chatRequest, tools []chatTool, imageResolvers ...imageResolver) (chatConversation, error) {
 	conv := chatConversation{Messages: [][]byte{}, Last: "."}
 	size := 0
+	mediaBytes, remoteImages := 0, 0
+	var fetch imageResolver
+	if len(imageResolvers) > 0 {
+		fetch = imageResolvers[0]
+	}
 	systems := []string{}
 	add := func(role string, content any) {
 		conv.Messages = append(conv.Messages, encodeJSON(map[string]any{"role": role, "content": content}))
 	}
 	for _, m := range chat.Messages {
+		role := str(m["role"])
+		if role != "system" && role != "developer" && role != "user" && role != "assistant" && role != "tool" {
+			return conv, failure(400, "Unsupported message role")
+		}
+		if role != "user" {
+			if err := validateTextParts(m["content"]); err != nil {
+				return conv, err
+			}
+		}
 		if role := str(m["role"]); role == "system" || role == "developer" {
 			if text := textOf(m["content"]); text != "" {
 				systems = append(systems, text)
@@ -226,15 +247,12 @@ func conversation(chat chatRequest, tools []chatTool) (chatConversation, error) 
 			for _, raw := range array(m["tool_calls"]) {
 				call := object(raw)
 				if kind := str(call["type"]); kind != "" && kind != "function" {
-					continue
+					return conv, failure(400, "Unsupported historical tool call type")
 				}
 				f := object(call["function"])
-				args := object(f["arguments"])
-				if args == nil {
-					args, _ = jsonObject([]byte(str(f["arguments"])))
-				}
-				if args == nil {
-					args = map[string]any{}
+				args, err := nativeArgs(f["arguments"])
+				if err != nil {
+					return conv, failure(400, "Historical function arguments must be a valid JSON object")
 				}
 				id := str(call["id"])
 				content = append(content, map[string]any{"type": "tool-call", "toolCallId": cursorCallID(id), "toolName": dynamicCall, "args": map[string]any{"namespace": "magpie", "toolName": str(f["name"]), "arguments": args}})
@@ -250,13 +268,18 @@ func conversation(chat chatRequest, tools []chatTool) (chatConversation, error) 
 		parts := array(m["content"])
 		if text, ok := m["content"].(string); ok {
 			parts = []any{map[string]any{"type": "text", "text": text}}
+		} else if m["content"] != nil && parts == nil {
+			return conv, failure(400, "User content must be text or a supported content array")
 		}
 		first := ""
 		for _, raw := range parts {
 			part := object(raw)
 			switch str(part["type"]) {
 			case "text":
-				text := str(part["text"])
+				text, ok := part["text"].(string)
+				if !ok {
+					return conv, failure(400, "Text content must be a string")
+				}
 				if text != "" {
 					content = append(content, map[string]any{"type": "text", "text": text})
 					size += len(text)
@@ -269,21 +292,31 @@ func conversation(chat chatRequest, tools []chatTool) (chatConversation, error) 
 				if u == "" {
 					u = str(object(part["image_url"])["url"])
 				}
-				if strings.HasPrefix(u, "data:") {
-					at := strings.Index(u, ";base64,")
-					if at < 5 {
-						return conv, failure(400, "Invalid image data URL")
+				if !strings.HasPrefix(u, "data:") {
+					remoteImages++
+					if remoteImages > maxRemoteImages {
+						return conv, failure(413, "A request may fetch at most eight remote images")
 					}
-					data, err := base64.StdEncoding.DecodeString(u[at+8:])
-					if err != nil {
-						return conv, failure(400, "Invalid base64 image")
-					}
-					content = append(content, map[string]any{"type": "image", "mimeType": u[5:at], "image": map[string]any{"__type": "Uint8Array", "hex": hex.EncodeToString(data)}})
-				} else {
-					content = append(content, map[string]any{"type": "text", "text": "[attachment image: " + u + "]"})
 				}
+				data, mimeType, err := decodeInputImage(u, fetch)
+				if err != nil {
+					return conv, err
+				}
+				mediaBytes += len(data)
+				content = append(content, map[string]any{"type": "image", "mimeType": mimeType, "image": map[string]any{"__type": "Uint8Array", "hex": hex.EncodeToString(data)}})
 			case "file":
-				content = append(content, map[string]any{"type": "text", "text": "[attachment " + str(object(part["file"])["filename"]) + "]"})
+				file := object(part["file"])
+				text, err := decodeTextFile(file)
+				if err != nil {
+					return conv, err
+				}
+				mediaBytes += len(text)
+				content = append(content, map[string]any{"type": "text", "text": "[attachment " + str(file["filename"]) + "]\n" + text})
+			default:
+				return conv, failure(400, "Unsupported message content type; use text, image_url, or a textual file")
+			}
+			if mediaBytes > maxInputMediaBytes {
+				return conv, failure(413, "Decoded request attachments exceed the 16 MiB total limit")
 			}
 		}
 		answer()

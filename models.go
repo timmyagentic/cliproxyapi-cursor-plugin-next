@@ -318,7 +318,7 @@ func (e modelEntry) info() any {
 			levels = append(levels, l)
 		}
 	}
-	info := map[string]any{"ID": "cursor/" + e.ID, "Object": "model", "OwnedBy": "cursor", "Type": "cursor", "Name": e.ID, "DisplayName": e.Name, "ContextLength": e.Context, "InputTokenLimit": e.Context, "MaxCompletionTokens": 0, "SupportedGenerationMethods": []string{"chat"}, "SupportedInputModalities": []string{"text", "image"}, "SupportedOutputModalities": []string{"text"}, "SupportedParameters": []string{"tools", "tool_choice", "reasoning_effort", "service_tier"}}
+	info := map[string]any{"ID": "cursor/" + e.ID, "Object": "model", "OwnedBy": "cursor", "Type": "cursor", "Name": e.ID, "DisplayName": e.Name, "ContextLength": e.Context, "InputTokenLimit": e.Context, "MaxCompletionTokens": 0, "SupportedGenerationMethods": []string{"chat"}, "SupportedInputModalities": []string{"text", "image"}, "SupportedOutputModalities": []string{"text"}, "SupportedParameters": []string{"tools", "tool_choice", "parallel_tool_calls", "reasoning_effort", "service_tier"}}
 	if len(levels) > 0 {
 		info["Thinking"] = map[string]any{"Levels": levels, "ZeroAllowed": indexOf(levels, "none") >= 0, "DynamicAllowed": false}
 	}

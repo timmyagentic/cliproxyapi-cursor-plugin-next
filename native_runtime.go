@@ -12,12 +12,14 @@ import (
 // An executor callback does not include the host's effective proxy/TLS policy.
 // Empty proxy therefore means host-owned HTTP, never implicit direct access.
 type nativeConfig struct {
-	Mode  string `yaml:"transport"`
-	Proxy string `yaml:"native-proxy-url"`
+	Mode                     string `yaml:"transport"`
+	Proxy                    string `yaml:"native-proxy-url"`
+	ToolResultTimeoutSeconds int    `yaml:"native-tool-result-timeout-seconds"`
+	RunLifetimeSeconds       int    `yaml:"native-run-lifetime-seconds"`
 }
 
 func parseNativeConfig(raw []byte) (nativeConfig, error) {
-	var cfg nativeConfig
+	cfg := nativeConfig{ToolResultTimeoutSeconds: nativeDefaultToolResultSeconds, RunLifetimeSeconds: nativeDefaultRunSeconds}
 	if len(raw) > 64<<10 {
 		return cfg, failure(400, "Invalid Cursor transport configuration")
 	}
@@ -34,6 +36,15 @@ func parseNativeConfig(raw []byte) (nativeConfig, error) {
 	}
 	if cfg.Mode == "native" && cfg.Proxy == "" {
 		return cfg, failure(400, "Native Cursor transport requires native-proxy-url (direct or an explicit proxy URL)")
+	}
+	if cfg.ToolResultTimeoutSeconds < nativeMinToolResultSeconds || cfg.ToolResultTimeoutSeconds > nativeMaxToolResultSeconds {
+		return cfg, failure(400, "native-tool-result-timeout-seconds must be between %d and %d", nativeMinToolResultSeconds, nativeMaxToolResultSeconds)
+	}
+	if cfg.RunLifetimeSeconds < nativeMinRunSeconds || cfg.RunLifetimeSeconds > nativeMaxRunSeconds {
+		return cfg, failure(400, "native-run-lifetime-seconds must be between %d and %d", nativeMinRunSeconds, nativeMaxRunSeconds)
+	}
+	if cfg.ToolResultTimeoutSeconds >= cfg.RunLifetimeSeconds {
+		return cfg, failure(400, "native-tool-result-timeout-seconds must be shorter than native-run-lifetime-seconds")
 	}
 	// Validate before accounting configuration can replace a journal or policy.
 	// Construction only parses the route; it does not open a network connection.
@@ -61,6 +72,8 @@ func (p *pluginRuntime) configureNativeLocked(cfg nativeConfig) error {
 			return err
 		}
 		sessions = newNativeSessions(p.ctx, pool.Open)
+		sessions.limits.PendingTTL = time.Duration(cfg.ToolResultTimeoutSeconds) * time.Second
+		sessions.limits.Lifetime = time.Duration(cfg.RunLifetimeSeconds) * time.Second
 		sessions.OnStart = func(receipt nativeReceipt) error {
 			if err := p.beginNativeAccounting(receipt); err != nil {
 				return err
@@ -164,6 +177,7 @@ func (p *pluginRuntime) nativeTerminal(receipt nativeReceipt, terminal runEvent)
 		"internal_tool_calls": terminal.internalCalls, "observed_internal_steps": terminal.internalSteps,
 		"journal": p.journal.Health(),
 	}
+	terminal.accounting["deadlines"] = nativeDeadlineMetadata(receipt)
 	if runUsage != nil {
 		terminal.accounting["run_usage"] = runUsage
 	}

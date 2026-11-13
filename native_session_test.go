@@ -388,7 +388,7 @@ func TestNativeSingleReservationAndBoundedReplay(t *testing.T) {
 		t.Fatal("retry resubmitted results or lost its replay marker")
 	}
 	time.Sleep(60 * time.Millisecond)
-	if _, _, err = ns.Start(context.Background(), next); err == nil || errorStatus(err) != 409 {
+	if _, _, err = ns.Start(context.Background(), next); err == nil || errorStatus(err) != 400 {
 		t.Fatalf("expired replay was accepted: %v", err)
 	}
 }
@@ -408,7 +408,7 @@ func TestNativeUncertainResultWriteCannotBeResubmitted(t *testing.T) {
 		t.Fatalf("lost uncertain outcome: %+v", out)
 	}
 	before := len(tr.snapshot())
-	if _, _, err = ns.Start(context.Background(), next); err == nil || errorStatus(err) != 409 {
+	if _, _, err = ns.Start(context.Background(), next); err == nil || errorStatus(err) != 400 {
 		t.Fatalf("uncertain exec accepted again: %v", err)
 	}
 	if opens.Load() != 1 || len(tr.snapshot()) != before {
@@ -599,7 +599,7 @@ func TestNativeImportsLegacyHandlesButRejectsExpiredNewHandles(t *testing.T) {
 	tr.push(nativeTestFinal("imported"))
 	_ = nativeReadEvents(t, events)
 	in.Chat.Messages[len(in.Chat.Messages)-1]["tool_call_id"] = "call_cursor_0123456789abcdef0123456789abcdef_0_0"
-	if _, _, err = ns.Start(context.Background(), in); err == nil || errorStatus(err) != 409 || opens.Load() != 1 {
+	if _, _, err = ns.Start(context.Background(), in); err == nil || errorStatus(err) != 400 || opens.Load() != 1 {
 		t.Fatal("expired correlated handle opened a replacement")
 	}
 }
@@ -624,7 +624,7 @@ func TestNativeResultWriteErrorsPreserveTransportStatusWithoutResubmission(t *te
 					t.Fatalf("transport status lost: %+v", out)
 				}
 				before := len(tr.snapshot())
-				if _, _, err = ns.Start(context.Background(), next); err == nil || errorStatus(err) != 409 || len(tr.snapshot()) != before || opens.Load() != 1 {
+				if _, _, err = ns.Start(context.Background(), next); err == nil || errorStatus(err) != 400 || len(tr.snapshot()) != before || opens.Load() != 1 {
 					t.Fatal("denied/uncertain native result was resubmitted")
 				}
 			})
@@ -710,7 +710,7 @@ func TestNativeExpiredPendingDeadlineRejectsBeforeDelayedTimerCallback(t *testin
 	owner.mu.Unlock()
 	before := len(tr.snapshot())
 	_, _, err := ns.Start(context.Background(), next)
-	if err == nil || errorStatus(err) != 409 || len(tr.snapshot()) != before || opens.Load() != 1 {
+	if err == nil || errorStatus(err) != 400 || len(tr.snapshot()) != before || opens.Load() != 1 {
 		t.Fatal("expired result raced a delayed TTL callback into a write")
 	}
 }
@@ -1012,7 +1012,7 @@ func TestNativeNewUserTurnSupersedesOnlyItsDeliveredParkedRun(t *testing.T) {
 		t.Fatal("supersede mutated caller history")
 	}
 	late := nativeContinuation(t, in, pending)
-	if _, _, err = ns.Start(context.Background(), late); err == nil || errorStatus(err) != 409 {
+	if _, _, err = ns.Start(context.Background(), late); err == nil || errorStatus(err) != 400 {
 		t.Fatalf("late results reused superseded execs: %v", err)
 	}
 	if len(tr.snapshot()) != 0 || len(snapshot()[1].snapshot()) != 0 {

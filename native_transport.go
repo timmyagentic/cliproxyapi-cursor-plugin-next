@@ -35,8 +35,8 @@ const nativeHandshakeWait = 15 * time.Second
 const nativeWriteWait = 30 * time.Second
 
 var errNativeNoH2ALPN = errors.New("Cursor native HTTP/2 ALPN unavailable before request submission")
-var errNativeHeadTimeout = transportFailure(504, "Native Cursor response header deadline exceeded")
-var errNativeWriteTimeout = transportFailure(504, "Native Cursor write deadline exceeded; outcome uncertain, cannot resubmit")
+var errNativeHeadTimeout = nativeTransportFailure(504, "response_headers", "timeout", "Native Cursor response header deadline exceeded", true)
+var errNativeWriteTimeout = nativeTransportFailure(504, "write", "timeout", "Native Cursor write deadline exceeded; outcome uncertain, cannot resubmit", true)
 
 // The pool contains clients, never request headers or host callbacks. Endpoint
 // and trust injection are package-local test seams, not operator TLS bypasses.
@@ -244,10 +244,13 @@ func nativeSafeError(ctx context.Context, phase string, cause ...error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if len(cause) > 0 && nativeNetworkFailure(cause[0]) {
-		return transportFailure(502, "Native Cursor "+phase+" failed")
+	var original error
+	if len(cause) > 0 {
+		original = cause[0]
 	}
-	return failure(502, "Native Cursor %s failed", phase)
+	// phase is a local operation label. Never format the underlying error, which
+	// may include a bearer URL, proxy credentials, or an upstream body.
+	return nativeTransportFailure(502, strings.ReplaceAll(phase, " ", "_"), nativeTransportReason(phase, original), "Native Cursor "+phase+" failed", nativeNetworkFailure(original))
 }
 
 func (p *nativeTransportPool) open(ctx context.Context, entry *nativeTransportEntry, token, requestID string, first []byte, release func(), h2 bool) (*nativeWireRun, bool, error) {
@@ -375,7 +378,7 @@ func nativeHTTPError(status int) error {
 	if status < 400 || status > 599 {
 		status = 502
 	}
-	return failure(status, "Native Cursor upstream returned HTTP %d", status)
+	return nativeFailure(status, "cursor_native_upstream_error", "http_"+strconv.Itoa(status), "Native Cursor upstream returned HTTP "+strconv.Itoa(status))
 }
 
 func (t *nativeWireRun) Protocol() string { return t.protocol }
@@ -530,7 +533,7 @@ func (t *nativeWireRun) Next(ctx context.Context) ([]byte, bool, error) {
 		if errors.As(err, &read) {
 			err = nativeSafeError(ctx, "stream read", err)
 		} else {
-			err = nativeSafeError(ctx, "stream read")
+			err = nativeSafeError(ctx, "stream decode", err)
 		}
 		t.shutdown(err)
 		return nil, false, err
@@ -538,7 +541,7 @@ func (t *nativeWireRun) Next(ctx context.Context) ([]byte, bool, error) {
 	if end {
 		var trailer map[string]json.RawMessage
 		if json.Unmarshal(data, &trailer) != nil || trailer == nil {
-			err = failure(502, "Native Cursor Connect trailer is malformed")
+			err = nativeFailure(502, "cursor_native_transport_error", "stream_decode/invalid_trailer", "Native Cursor Connect trailer is malformed")
 		} else if raw := trailer["error"]; len(raw) > 0 && string(raw) != "null" {
 			var detail struct {
 				Code string `json:"code"`
@@ -548,7 +551,7 @@ func (t *nativeWireRun) Next(ctx context.Context) ([]byte, bool, error) {
 			if status == 0 {
 				status = 502
 			}
-			err = failure(status, "Native Cursor Connect stream returned an error")
+			err = nativeFailure(status, "cursor_native_upstream_error", "connect_status_"+strconv.Itoa(status), "Native Cursor Connect stream returned an error")
 		}
 		if err != nil {
 			t.shutdown(err)
