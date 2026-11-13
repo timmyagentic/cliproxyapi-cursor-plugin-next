@@ -37,6 +37,27 @@ full history; inspect completed tool side effects first. Exact per-step context
 counts and compaction across a pending handoff remain unavailable. See
 [native session boundaries](docs/native-sessions.md).
 
+## Run usage page
+
+The existing CPA plugin menu can open **Cursor 用量** without replacing the desktop
+or core. The public page contains no measurements; it reads the authenticated
+`/v0/management/plugins/cursor-next/accounting/runs` endpoint using the existing
+CPA webview authentication bridge. Outside that webview, a management credential
+is required and is never saved by this page.
+
+Each row is one Run observation, not one HTTP request. The view shows at most the
+latest 200 active-journal records; it does not scan archives or claim lifetime
+totals. Input already includes cached input, and output includes reasoning.
+Unknown measurements remain unknown. Throughput is whole-Run output divided by
+elapsed time, including tool waits, rather than decoder-only speed.
+
+Grok 4.7 cost is explicitly an estimate from [Cursor's published rates](https://cursor.com/docs/models/grok-4-7),
+not an additional subscription charge. Fast and standard rates differ. When a
+cumulative Run exceeds 256k input, its individual inference sizes are unknown,
+so the page shows a price range; `@500k` alone never selects a higher rate.
+Unpriced models, cache writes without a published rate, and unknown usage stay
+unpriced. CPA's generic request-details rows are unchanged.
+
 ## Request support
 
 | Input or control | Plugin behavior |
@@ -75,7 +96,7 @@ worktree's `.git` file and select an enclosing repository. The binary embeds the
 and attribution, also available through the `plugin.license` ABI method. The
 historical Node reference is excluded from native builds.
 
-Version **0.2.2** is the plugin-only hardening candidate; the withdrawn 0.2.1
+Version **0.2.3** adds a plugin-owned Run usage view to the plugin-only hardening candidate; the withdrawn 0.2.1
 cross-component proposal is not a prerequisite or an upgrade target. Building
 does not install or publish a release. Use an independent CPA process for
 validation; installation and rollback instructions are separate. A version

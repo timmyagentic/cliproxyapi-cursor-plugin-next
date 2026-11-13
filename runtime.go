@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const version = "0.2.2"
+const version = "0.2.3"
 const pluginID = "cursor-next"
 const pluginLogo = "https://raw.githubusercontent.com/timmyagentic/cliproxyapi-cursor-plugin-next/main/assets/cursor.png"
 const cursorAPI = "https://api2.cursor.sh"

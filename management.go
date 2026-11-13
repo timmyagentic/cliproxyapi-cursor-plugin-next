@@ -12,7 +12,11 @@ import (
 //go:embed assets/login.html
 var loginHTML string
 
+//go:embed assets/usage.html
+var usageHTML string
+
 var loginTemplate = template.Must(template.New("login").Parse(loginHTML))
+var usageTemplate = template.Must(template.New("usage").Parse(usageHTML))
 
 func (p *pluginRuntime) registerManagement(req rpcRequest) any {
 	base := strings.TrimRight(req.BasePath, "/")
@@ -30,8 +34,12 @@ func (p *pluginRuntime) registerManagement(req rpcRequest) any {
 		"routes": []any{
 			map[string]any{"Method": "POST", "Path": base + "/plugins/" + pluginID + "/api-key"},
 			map[string]any{"Method": "GET", "Path": base + "/plugins/" + pluginID + "/accounting"},
+			map[string]any{"Method": "GET", "Path": base + "/plugins/" + pluginID + "/accounting/runs"},
 		},
-		"resources": []any{map[string]any{"Path": resource + "/login", "Menu": "Cursor", "Description": "Cursor API Key 登录"}},
+		"resources": []any{
+			map[string]any{"Path": resource + "/login", "Menu": "Cursor", "Description": "Cursor API Key 登录"},
+			map[string]any{"Path": resource + "/usage", "Menu": "Cursor 用量", "Description": "按整次 Run 查看用量与估算费用"},
+		},
 	}
 }
 
@@ -54,6 +62,18 @@ func (p *pluginRuntime) handleManagement(s *requestScope, req rpcRequest) (any, 
 		// CPA authenticates this route. Diagnostics retain Run/context semantics
 		// without exposing identities or scanning the historical journal archive.
 		return managementResponse(200, "application/json", encodeJSON(p.accountingDiagnostics())), nil
+	}
+	if req.Method == http.MethodGet && req.Path == base+"/plugins/"+pluginID+"/accounting/runs" {
+		// Like accounting diagnostics, this route is authenticated by CPA.
+		return managementResponse(200, "application/json", encodeJSON(p.accountingRuns())), nil
+	}
+	if req.Method == http.MethodGet && req.Path == resource+"/usage" {
+		var body bytes.Buffer
+		if err := usageTemplate.Execute(&body, map[string]string{"Endpoint": base + "/plugins/" + pluginID + "/accounting/runs"}); err != nil {
+			return nil, err
+		}
+		// The public resource contains only the UI, never a journal snapshot.
+		return managementResponse(200, "text/html; charset=utf-8", body.Bytes()), nil
 	}
 	if req.Method == http.MethodGet && req.Path == resource+"/login" {
 		var body bytes.Buffer

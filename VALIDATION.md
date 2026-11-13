@@ -1,5 +1,22 @@
 # Validation
 
+## 0.2.3 plugin-owned usage view
+
+The usage view is an optional plugin resource in the desktop's existing plugin
+menu. Neither the CPA core nor desktop needs a replacement build. Validate the
+authenticated `/accounting/runs` data route independently of the public static
+page: unauthenticated data access must fail, while the page itself must contain
+no journal snapshot or credential. The C ABI smoke now exercises both new routes.
+
+Focused tests cover bounded latest-200 selection, one row per revised Run,
+unknown versus measured zero, privacy, durations and Grok pricing. The known
+47,386-input/35,200-cache/569-output Fast observation estimates $0.090772.
+Cumulative input above 256k produces a range because individual inference sizes
+are unavailable. UI checks cover the existing same-origin authentication bridge,
+filtering, escaping, a bounded refresh, and no credential storage by the page.
+Finally verify the actual installed desktop can open the menu and render real
+records, without changing the generic request-details database or standard usage.
+
 ## 0.2.2 acceptance scope
 
 This hardening remains plugin-only. The withdrawal of the 0.2.1 cross-component
