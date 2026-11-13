@@ -42,6 +42,42 @@ func TestNativeFirstFailureABIIsSanitizedAndClassified(t *testing.T) {
 	}
 }
 
+func TestNativeRequestScopedMappingIsLimitedToPermanentLocalHandles(t *testing.T) {
+	transport := nativeSafeError(context.Background(), "stream read", io.EOF)
+	for _, err := range []error{
+		nativePermanentFailure("cursor_native_owner_unavailable", "owner_not_retained", "native owner is unavailable"),
+		nativeLostOwner(nativeFailureDetails(transport)),
+		nativePermanentFailure("cursor_native_deadline", "tool_result_timeout", "native tool-result deadline expired"),
+	} {
+		detail := pluginErrorDetail(err)
+		if detail.Code != "request_scoped" || detail.HTTPStatus != 410 || detail.RetryAfterSeconds != 0 {
+			t.Fatalf("permanent local failure could penalize the credential: %+v", detail)
+		}
+		if !strings.Contains(detail.Message, "code="+nativeErrorCode(err)) || !strings.Contains(detail.Message, "retry_same_request=false") {
+			t.Fatal("scope classification discarded the native subtype or recovery contract")
+		}
+	}
+	for _, tc := range []struct {
+		err        error
+		code       string
+		status     int
+		retryAfter int
+	}{
+		{transport, "cursor_native_transport_error", 502, 2},
+		{nativeHTTPError(401), "cursor_native_upstream_error", 401, 0},
+		{nativeHTTPError(429), "cursor_native_upstream_error", 429, 0},
+		{nativeHTTPError(410), "cursor_native_upstream_error", 410, 0},
+		{nativeContinuationFailure("cursor_native_context_changed", "contract_changed", "native contract changed"), "cursor_native_context_changed", 409, 0},
+		{failure(400, "invalid input"), "cursor_error", 400, 0},
+		{failure(413, "input exceeds size limit"), "cursor_error", 413, 0},
+	} {
+		detail := pluginErrorDetail(tc.err)
+		if detail.Code != tc.code || detail.HTTPStatus != tc.status || detail.RetryAfterSeconds != tc.retryAfter {
+			t.Fatalf("local 410 fix changed unrelated error routing: %+v", detail)
+		}
+	}
+}
+
 // Negative recovery PoC: Send records the bytes before reporting an error. The
 // caller has the complete history and completed tool results, but cannot know
 // whether Cursor accepted that write. Never reconstruct/replay it automatically.

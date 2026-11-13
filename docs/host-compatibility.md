@@ -51,6 +51,32 @@ The plugin's bounded authenticated accounting diagnostics remain independent
 of the standard Responses fields: Run measurements and unknown context are
 reported separately, and no companion core/desktop feed is required.
 
+## Request-local failures on CPA 8.0.63
+
+A separate synthetic C ABI probe on the installed **8.0.63** host checked each
+error followed by the same invalid request and then a valid request. An ordinary
+410 carrying a provider-specific code produced `410, 503, 503`: CPA cooled the
+credential after the first error. Using the existing ABI code `request_scoped`
+produced `410, 410, 200`, with all three requests reaching the fixture. Both
+nonstream and stream-opening errors passed; a late `host.stream.close` error
+also left the next valid request available. No provider request or global
+cooldown setting was used.
+
+The plugin therefore marks only its local `owner_unavailable`, `owner_lost` and
+`deadline` failures with HTTP 410 as `request_scoped`. Their stable
+`cursor_native_*` subtype and recovery action remain in the message. An actual
+upstream HTTP 410 keeps its upstream classification. Ordinary input 400,
+contract-conflict 409 and size-limit 413 were already availability-neutral on
+this host. Authentication 401 and quota 429 still blocked subsequent execution;
+a real-transport 502 fixture retained its two-second cooldown and recovered
+after the wait.
+
+An explicit zero or negative `retry_after_seconds` did not prevent the 410
+cooldown: this host treats nonpositive plugin retry hints as absent. The
+`request_scoped` availability behavior above is verified only on **8.0.63**;
+it has not been extrapolated to the older 8.0.38/8.0.43 hosts or to generic
+client retry behavior.
+
 ## Separate host patch tested against 8.0.43
 
 The separate [plugin-usage-presence patch](https://github.com/router-for-me/CLIProxyAPI/pull/7012) on top of CPA 8.0.43 passed the historical real

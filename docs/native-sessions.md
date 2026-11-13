@@ -118,10 +118,17 @@ may ignore the optional ABI field.
 
 Permanently expired, ended or missing owners, including handles from before a
 restart, return **410 Gone** rather than a retryable busy conflict. The error
-includes a stable `cursor_native_*` code, a bounded reason and
+message includes a stable `cursor_native_*` subtype, a bounded reason and
 `retry_same_request=false`. Busy/in-flight or correctable contract conflicts
 remain 409; a first transport failure retains its original 502/504 status.
 An uncertain write is never silently replayed into a different native exec.
+
+For those local 410 failures, the C ABI error code is `request_scoped`. On the
+verified CPA **8.0.63** host this preserves HTTP 410 while keeping the credential
+available for the next valid request; an unclassified 410 instead cooled the
+credential. The native subtype stays in the message. Real upstream, transport,
+authentication and quota errors retain their existing classification. This
+availability behavior has not been verified on the older 8.0.38/8.0.43 hosts.
 Generic host/client retry behavior must be checked on the actual versions; a
 machine code alone is not proof that the client stops retrying.
 

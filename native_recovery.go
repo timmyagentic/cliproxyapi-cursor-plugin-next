@@ -46,8 +46,8 @@ func (e *nativeRecoveryError) Error() string {
 
 func (e *nativeRecoveryError) Unwrap() error { return e.err }
 
-// The host may discard extension fields, so the stable code is also present in
-// Error(). pluginErrorDetail uses this helper for the existing ABI code field.
+// The stable subtype is always present in Error(). For local permanent handle
+// failures, pluginErrorDetail reserves the ABI code for host request scoping.
 func nativeErrorCode(err error) string {
 	var detail *nativeRecoveryError
 	if errors.As(err, &detail) {
