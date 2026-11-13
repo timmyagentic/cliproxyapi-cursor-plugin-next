@@ -15,24 +15,55 @@ name and schema. Caller tool names, descriptions, and schemas are not
 interpolated into this system instruction. Tools with no complete description
 still retain their exact native definitions.
 
-User and developer instructions retain their original order and text. Changing
+User text is retained in turn order. System and developer text is merged into
+the system prompt in encounter order; this does not establish native independent
+developer-role authority. Changing
 tool metadata no longer changes the appended routing instruction; this preserves
 that part of the system prefix across requests. Native tool metadata may still
 affect upstream caching, so this is not a cache-hit guarantee.
 
-`tool_choice: none` supplies neither the routing instruction nor native tools.
-A named function choice restricts the native definitions to the matching caller
+For a fresh Run, `tool_choice: none` supplies neither the routing instruction nor
+native tools. A named function choice restricts the native definitions to the matching caller
 tool. Automatic and required choices retain all caller tools, as before. The
 executor's allowlist and namespace checks continue to reject unregistered and
 foreign tool calls; the system hint never grants authority to execute a tool.
-The existing implementation does not enforce a required invocation if Cursor
-chooses a text answer. This change does not add that enforcement.
+The completed output batch is checked before any call is exposed: `required`
+needs at least one call, forced choice needs exactly one matching call, and
+`parallel_tool_calls=false` permits at most one. A text-only completion cannot
+satisfy a required invocation. A rejected batch ends the native owner rather
+than exposing a valid prefix of an invalid batch.
 
-The reference transcript fixtures remain unchanged. Tests replace only their
-exact legacy system-catalog suffix with the compact hint before comparing the
-entire transcript. User/developer text, assistant reasoning, prior tool calls,
-tool results, missing-result handling, and image content continue to match the
-reference fixtures.
+Within a retained native Run, the complete tool declarations and schemas must
+stay unchanged, while `tool_choice` and `parallel_tool_calls` can change for the
+next response. The new policy takes effect only when a complete tool-result batch
+is validated and reserved. `required` followed by `auto` or `none` can therefore
+return final text without opening another Run. An identical result retry must
+also retain its reserved policy; cached output is not reused under a different
+policy.
+
+Policy changes can narrow the original native catalog and later restore tools
+from that catalog. They cannot introduce new executable tools. For example,
+declaring `read` and `write` while initially forcing `read` bootstraps only `read`;
+switching to `auto` would add `write` and is rejected with 409. To finish with text,
+use `none` and preserve the declarations, or begin an explicit new user turn to
+bootstrap a broader catalog. Forcing the only declared tool and then selecting
+`auto` is supported. Changing a schema or strictness remains a contract conflict,
+including when the next policy is `none`.
+
+For `strict` function tools, JSON Schema validation uses a maintained validator,
+Draft 2020-12 by default (or the schema's supported explicit draft), with format
+assertions enabled. Local definitions are supported; network and local-file
+external references are not. Invalid argument output is rejected without
+repairing names, values or types. This is response validation, not an upstream
+guarantee of arbitrary Lark grammar constrained decoding.
+
+Valid reference transcript fixtures still compare the compact catalog hint,
+assistant reasoning, prior tool calls, results and data-URL image bytes. The
+legacy filename-only/unfetched-URL attachment fixture is now intentionally
+rejected rather than retaining a misleading placeholder. Dedicated attachment
+tests require real decoded UTF-8 file data or image bytes, and cover the explicit
+native-route requirement for public image downloads. Tests must not call that
+intentional rejection equivalent to reading the original attachment.
 
 A deterministic synthetic fixture with 32 tools measures bytes, not tokens:
 

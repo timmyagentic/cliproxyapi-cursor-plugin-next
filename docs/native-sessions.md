@@ -14,6 +14,8 @@ Consequently, runtime-owned transport requires an explicit operator route:
 ```yaml
 transport: native
 native-proxy-url: direct # or http(s)://proxy:port, socks5(h)://proxy:port
+native-tool-result-timeout-seconds: 120
+native-run-lifetime-seconds: 900
 ```
 
 `auto` (default) uses native sessions only when that route is explicit. An empty
@@ -48,10 +50,22 @@ stateDiagram-v2
 Handles contain an unguessable owner identity, turn and call index. The next
 request must match the account, model/Max/Fast parameters, optional caller
 scope, complete history, emitted tool calls and executable tool contract.
-Description-only changes are accepted; changed schemas, strictness or policy
-are rejected. Every result is checked before the first upstream write, then
-reserved atomically. Concurrent or changed retries return 409. A fully delivered
-response can be replayed for an identical result request without writing to
+Description-only changes are accepted; the complete declared tool set, schemas
+and strictness remain fixed. `tool_choice` and `parallel_tool_calls` govern the
+next response and may change when submitting a new complete result batch, within
+the tool catalog introduced at native bootstrap. For example, `required` can
+become `auto` or `none` so the same Run can return final text. A forced choice can
+likewise become `auto` when that does not introduce additional native tools.
+
+The initial forced choice exposes only its selected tool. If the declaration
+also contained another tool, switching to `auto` would expand the native catalog
+and returns 409 with an explicit new-user-turn boundary. `none` with the unchanged
+declarations can still finish that Run. A policy cannot hide a schema change or
+silently create another native Run. See [tool policy details](tool-payload.md).
+
+Every result is checked before the first upstream write, then reserved atomically
+with the next response's policy. Concurrent or changed retries return 409. A fully delivered
+response can be replayed for an identical result request and policy without writing to
 Cursor or charging another Run. This is process-local replay, not a promise of
 exactly-once external side effects across crashes.
 
@@ -71,14 +85,28 @@ ABI has no push cancellation callback, so caller disconnection before a complete
 nonstream response cannot be detected promptly. Prefer streaming for native
 tool workflows. Plugin shutdown cancels both modes and waits for workers.
 
-Limits: eight retained owners per account, 32 per process, 120-second tool-result
-wait, 15-minute Run lifetime, 30-second incomplete-batch wait, 16 MiB retained
+Limits: eight retained owners per account, 32 per process, a default 120-second
+tool-result wait and 15-minute Run lifetime, 30-second incomplete-batch wait, 16 MiB retained
 history/output budget and 64 MiB blobs. Native execs receive heartbeats while
 waiting for caller results. The upstream watchdog only runs while waiting on
 Cursor: 60 seconds without any frame or 240 seconds of heartbeat-only traffic.
 Real thinking resets the quiet timer; parking pauses it. Transport open/write
 and proxy handshakes are separately bounded at 15 seconds for connection and
 response-head establishment; queued writes have a 30-second bound.
+
+`native-tool-result-timeout-seconds` accepts 15–900 seconds;
+`native-run-lifetime-seconds` accepts 60–3600 seconds, with the tool wait strictly
+shorter than the Run lifetime. Each actual handoff deadline is the earlier of
+`now + tool wait` and `Run expiry - processing reserve`; the reserve is the
+smaller of 60 seconds or one tenth of the Run lifetime. A late handoff is rejected
+before publishing tools when no processing reserve remains. These are bounded
+local limits, not renewable leases or a promise of upstream resumability.
+
+Chat's `cursor_usage.deadlines` contains the Run expiry and actual pending-tool
+deadline when available. CPA Responses can drop extension fields or headers, so
+the plugin does not claim Codex sees each deadline. The existing authenticated
+accounting route reports effective transport and configured native limits for
+operators without exposing proxy URLs or per-Run identifiers.
 
 Locally identified network failures retain HTTP 502/504 and carry the existing
 CPA ABI's two-second retry hint. On stock 8.0.43 this replaces its otherwise
@@ -88,11 +116,26 @@ verification failures and caller cancellation do not acquire this hint. It
 does not replay a write or change global cooldown configuration; older hosts
 may ignore the optional ABI field.
 
-Expired owners, restart, changed history/compaction and uncertain submissions
-return explicit 409 rather than silently sending results to another native exec.
-A new user turn with complete history starts a fresh Run. Retention is for tool
+Permanently expired, ended or missing owners, including handles from before a
+restart, return **410 Gone** rather than a retryable busy conflict. The error
+includes a stable `cursor_native_*` code, a bounded reason and
+`retry_same_request=false`. Busy/in-flight or correctable contract conflicts
+remain 409; a first transport failure retains its original 502/504 status.
+An uncertain write is never silently replayed into a different native exec.
+Generic host/client retry behavior must be checked on the actual versions; a
+machine code alone is not proof that the client stops retrying.
+
+A new user turn with complete history starts a fresh Run. Inspect completed
+tool side effects before continuing, because a missing execution owner does not
+prove its earlier tool actions failed. Retention is for tool
 continuations within a turn; it does not eliminate all future history imports.
 Checkpoints and blobs help the live Run only; they are not restart handles.
+
+The process retains at most 128 sanitized failure summaries for ten minutes,
+scoped by account/caller ownership hashes. They preserve the original failure
+classification for a late handle lookup; they contain no history, bearer, URL
+or response body and cannot restore execution. Unknown failures remain explicitly
+unclassified rather than being assigned an invented upstream cause.
 
 A new explicit user message can retire a delivered parked predecessor only
 when account, conversation, caller scope and the complete old history prefix

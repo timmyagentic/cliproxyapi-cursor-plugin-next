@@ -1,5 +1,62 @@
 # Validation
 
+## 0.2.2 acceptance scope
+
+This hardening remains plugin-only. The withdrawal of the 0.2.1 cross-component
+proposal does not authorize companion CPA core or desktop changes. Keep the
+existing provider, credential, model/context limits and outbound route when
+comparing behavior.
+
+Current acceptance targets CPA 8.0.63 and Codex app-server 0.167.0. The historical
+0.2.0 results below are dated evidence, not a pass on those newer versions.
+The following are verification steps; record their actual outcomes and exact
+binary hashes separately rather than interpreting this list as a success claim.
+
+1. Run race/vet, the Python suites and actual C ABI loading. The accounting
+   diagnostic tests distinguish nil from measured zero, retain deferred/revised
+   observations, verify a read does not mutate the journal or scan archives,
+   and check that account/conversation/event identities stay out of the response.
+2. Build through `make build`, package it and compare the explicit embedded
+   source stamp with `git -C` at the plugin root. Compare module/toolchain from
+   `go version -m -json`, `.provenance.json` and the installed library SHA256.
+   Read `build` back from the authenticated accounting route. The build regression
+   uses a real nested linked worktree and invokes the builder from an external
+   directory; it must never stamp the enclosing repository. Dirty test builds
+   must say dirty; tagged release checks require a clean matching source commit.
+3. Exercise the real current host without a Cursor request using the existing
+   synthetic C ABI fixture:
+
+   ```sh
+   python3 integration/cpa_compat.py \
+     --cpa-binary /path/to/cpa-8.0.63 \
+     --state-dir "$PWD/.local-tests/compat-8.0.63" --port 28348
+   ```
+
+   Its default assertions describe the earlier unpatched host. If the host
+   contract has changed, inspect the exact client/recorder presence result;
+   do not call a changed host assertion a Cursor model failure or claim the
+   new version has the old limits without evidence. `--expect-patched` selects
+   the already-defined usage-presence contract, not a request to patch CPA.
+4. Start the actual candidate in an independent CPA listener with a private
+   journal using `integration/start_isolated.py --transport native` and an
+   explicit `--native-proxy-url`. Run the existing bounded tool/receipt protocol
+   and an ordinary follow-up. Check the candidate's version/source stamp, one
+   journal Run across its tool continuations, final Run measurement or explicit
+   unknown status, and no fabricated per-step context count.
+5. Run `integration/codex_probe.py` with the actual 0.167.0 executable and an
+   existing catalog entry. Preserve its context/compaction limits. Verify real
+   tool receipts, namespace/custom-call results, terminal parsing and any
+   structured error; HTTP 200 alone is insufficient. Compare the matching Run
+   journal with a separate later Dashboard read. A revised observation replaces
+   the prior view; it must not add that Run's input to the next request.
+
+Functional tool completion, recorded Run usage, current-context measurement
+and storage health are separate checks. A zero CPA row cannot pass an unknown
+measurement check. `deferred` already contains a later measurement; stable and
+provisional describe the observation, not a final billing guarantee. The
+management summary covers only bounded active records and is not an account
+total. No full-window or natural-compaction claim follows from the tool probe.
+
 ## Native 0.2.0 validation
 
 The native protocol/transport/runtime tests cover real local TLS HTTP/2 duplex,
@@ -212,8 +269,10 @@ unknown/zero distinction. CPA 8.0.38/8.0.43 omit unknown usage in Responses but 
 in their own recorder. They discard custom quality/deferred fields, filter the
 auxiliary header by default, drop cache-write detail in Responses and expose no
 late correction callback. Deferred journal records therefore do not repair the
-CPA row, and its zero is not a measured zero. Native Run retention is not
-implemented; tool results continue through authenticated imported history.
+CPA row, and its zero is not a measured zero. Native transport retains a Run
+across tool-result requests within the process; the optional host transport
+continues through authenticated imported history. Process restart and changed
+pending history do not restore a native owner automatically.
 
 These are explicit delivery boundaries. Neither a larger context limit, disabled
 compaction, renamed Fast alias nor an estimated flag is used as the repair.

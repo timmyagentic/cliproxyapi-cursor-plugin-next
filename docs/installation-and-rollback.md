@@ -6,7 +6,21 @@ are separate actions; no running installation is changed by the build or tests.
 ## Reviewable candidate
 
 Build the exact reviewed commit for the CPA host's OS/architecture, run the C ABI
-smoke test, and record its SHA256. The candidate library is `cursor-next.dylib`,
+smoke test, and record its SHA256 and package provenance. `make build` embeds
+the exact Git revision/dirty state through the maintained build entry point's
+`git -C` lookup and explicit embedded stamp. It does not rely on Go's automatic
+VCS discovery, which can misidentify nested linked worktrees. Packaging reads
+the stamp from the actual library, not the checkout at packaging time:
+
+```sh
+python3 scripts/release.py package --goos darwin --goarch arm64 --library dist/cursor-next.dylib
+```
+
+The sibling `.provenance.json` records source commit, dirty state, Go toolchain,
+target and library SHA256. An uncommitted test build is visibly dirty; rebuild
+from the final clean commit for a tagged release. ZIPs keep the single-library
+store layout. These records identify build inputs, not a cryptographic build
+attestation. The candidate library is `cursor-next.dylib`,
 `cursor-next.so` or `cursor-next.dll`; provider and model prefix remain `cursor`.
 Read `NOTICE.md`, `VALIDATION.md` and the host-compatibility limits before a
 switch. In particular, CPA's own zero/complete rows remain unreliable for omitted
@@ -34,8 +48,10 @@ validation; do not search-and-kill by a shared process name.
    journal. Disable `spx-cursor` before enabling `cursor-next`; do not let two
    executors own provider `cursor` in one host.
 3. Preserve credentials, aliases, routing and context/compaction settings. Restart
-   only the explicitly selected host, then read back loaded plugin ID/version
-   and checksum. A file copy alone is not proof it was loaded.
+   only the explicitly selected host, then read back loaded plugin ID/version,
+   the accounting route's `build.source_commit`/`source_dirty`/`go_version`, and
+   the installed library checksum. Compare them to the package provenance. A
+   file copy or a matching version string alone is not proof it was loaded.
 4. Run a short tool/result continuation, check measured/unknown journal states,
    and inspect the client's current-step usage. Accept only the documented
    behavior; do not treat the host's synthetic zero row as a measurement.

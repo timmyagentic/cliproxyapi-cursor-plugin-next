@@ -11,17 +11,17 @@ credentials. The fixture is separate from the production plugin.
 
 ## Verified host contracts
 
-| Behavior | CPA 8.0.38 | CPA 8.0.43 |
-| --- | --- | --- |
-| Known total input, cache read, output and reasoning reach Responses | Preserved | Preserved |
-| Cache write reaches CPA accounting | Preserved | Preserved |
-| Cache write reaches Responses | Omitted by host | Omitted by host |
-| Missing plugin usage reaches Responses | Usage omitted | Usage omitted |
-| Missing plugin usage reaches CPA accounting | Zero counters, `quality=complete` | Zero counters, `quality=complete` |
-| Authoritative zero reaches Responses | Explicit zero | Explicit zero |
-| Unknown reasoning counter reaches Responses | Not separately tested | Explicit zero; presence lost |
-| Custom estimated/deferred usage extensions | Dropped | Dropped |
-| Independent late usage correction callback | Unavailable | Unavailable |
+| Behavior | CPA 8.0.38 | CPA 8.0.43 | CPA 8.0.63 |
+| --- | --- | --- | --- |
+| Known total input, cache read, output and reasoning reach Responses | Preserved | Preserved | Preserved |
+| Cache write reaches CPA accounting | Preserved | Preserved | Preserved |
+| Cache write reaches Responses | Omitted by host | Omitted by host | Omitted by host |
+| Missing plugin usage reaches Responses | Usage omitted | Usage omitted | Usage omitted |
+| Missing plugin usage reaches CPA accounting | Zero counters, `quality=complete` | Zero counters, `quality=complete` | Zero counters, `quality=complete` |
+| Authoritative zero reaches Responses | Explicit zero | Explicit zero | Explicit zero |
+| Unknown reasoning counter reaches Responses | Not separately tested | Explicit zero; presence lost | Explicit zero; presence lost |
+| Custom estimated/deferred usage extensions | Dropped | Dropped | Dropped |
+| Independent late usage correction callback | Unavailable | Unavailable | Unavailable |
 
 The accounting limitation is material: a zero row in these hosts is not proof
 that Cursor measured zero input, zero cache or zero cost. The plugin's separate
@@ -38,10 +38,22 @@ Tested source revisions:
 
 - CPA 8.0.38: `0db19025571684b198a2ef508f99b41c717337e8`.
 - CPA 8.0.43: `307803510bce87f986fcf7b1a84190f105c7b4aa`.
+- CPA 8.0.63: installed macOS arm64 binary SHA256
+  `04548a2f062ba1111d632bef83c94a6edf9d5d17731828c8be61ae1473f4bc4b`;
+  all twelve synthetic C ABI cases passed on 2026-11-13, without a host patch
+  or a Cursor request. This binary identity does not assert its source commit.
 
-## Proposed upstream host fix (not a released CPA version)
+These are version-specific observations. For real-provider CPA 8.0.63 and Codex
+0.167.0 behavior, use the isolated app-server probe described in
+[current acceptance](../VALIDATION.md#022-acceptance-scope). The synthetic host
+test alone does not establish model correctness or client tool completion.
+The plugin's bounded authenticated accounting diagnostics remain independent
+of the standard Responses fields: Run measurements and unknown context are
+reported separately, and no companion core/desktop feed is required.
 
-The separate [plugin-usage-presence patch](https://github.com/router-for-me/CLIProxyAPI/pull/7012) on top of CPA 8.0.43 has passed the real
+## Separate host patch tested against 8.0.43
+
+The separate [plugin-usage-presence patch](https://github.com/router-for-me/CLIProxyAPI/pull/7012) on top of CPA 8.0.43 passed the historical real
 C-ABI twelve-case suite with `--expect-patched`. It changes only the plugin path:
 missing measurements have `quality=unclassified` and an explicit `observed`
 field-presence object; authoritative zero remains distinguishable. Responses

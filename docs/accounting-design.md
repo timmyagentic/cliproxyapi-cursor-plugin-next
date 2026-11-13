@@ -1,14 +1,18 @@
 # Measured tool-step usage
 
 Cursor's native Run normally publishes `TurnEnded` only after the caller's tool
-results have returned inside that Run. This plugin's stateless Chat Completions
-bridge returns the tool batch to its caller and closes the Run first. Therefore a
-tool batch can have no native usage message. Dividing request/output bytes by
-four does not measure that Run, its cache hits, or its reasoning output.
+results have returned inside that Run. Native transport retains that Run across
+tool-result requests and records its cumulative final observation separately.
+The optional stateless host transport instead closes the Run at a tool handoff,
+which may have no native usage message. Neither case provides a verified
+per-inference context counter. Dividing request/output bytes by four does not
+measure the Run, its cache hits, or its reasoning output.
 
-The bridge closes the native Run and stops its sender before querying
-`DashboardService/GetFilteredUsageEvents`. It waits for a bounded interval
-(8 seconds by default) for the measurement belonging to that Run. Dashboard
+After a Run closes without native counters, the resolver queries
+`DashboardService/GetFilteredUsageEvents` for a bounded interval (8 seconds by
+default). Native transport performs this work asynchronously after the reply;
+tool handoffs never wait for the Dashboard. The legacy host transport retains a
+bounded synchronous lookup. Dashboard
 requests use the existing CPA host HTTP callback, proxy, and request-scoped
 cancellation. Each HTTP request has a 2 second deadline. The first lookup waits
 at least one second after this resolver begins, after the Run has closed;
@@ -152,7 +156,20 @@ eviction/restart. Segments are audit archives, not an unlimited-storage promise;
 archive/retention remains an operator responsibility. OS file syscalls themselves
 have no Go deadline.
 
-The authenticated accounting management endpoint exposes health only. A host
-that drops custom response fields can still inspect degradation there. Schema v1
-is imported without deleting its original bytes, and interrupted active Runs
-remain audit records with no invented broad reconciliation window.
+The existing authenticated accounting management endpoint exposes health and a
+read-only summary of the bounded active journal. `with_measurement` counts
+nonnil Usage, including measured zero and `deferred`; `without_measurement`
+counts absent observations. Status/source/reason counts and the latest observed
+Run help diagnose missing data without exposing identities or scanning archive
+segments. No lifetime or daily token aggregate is claimed.
+
+`measured` versus `deferred` records whether the first measurement arrived on
+the immediate or delayed path, not whether it is currently payable or pending.
+`stable=false` with nonnil Usage can mean a later review failed; it does not erase
+the known observation. Native `Complete` marks its direct TurnEnded observation
+stable without Dashboard sampling. Both sources stay provisional. The endpoint's
+`contract` states these Run/context limits independently of host extensions.
+
+A host that drops custom response fields can still inspect degradation there.
+Schema v1 is imported without deleting its original bytes, and interrupted
+active Runs remain audit records with no invented broad reconciliation window.

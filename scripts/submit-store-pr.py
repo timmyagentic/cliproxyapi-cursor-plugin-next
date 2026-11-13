@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import sys
 import time
-from release import TARGETS
+from release import release_asset_names
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -50,8 +50,7 @@ def main():
     plugin = json.loads((ROOT / "registry.json").read_text())["plugins"][0]
     owner_repo = plugin["repository"].removeprefix("https://github.com/")
     tag = "v" + plugin["version"]
-    names = [f'{plugin["id"]}_{plugin["version"]}_{goos}_{goarch}.zip'
-             for goos, goarch in TARGETS]
+    names = release_asset_names(plugin)
     title = f'Add {plugin["name"]} provider'
     release_url = plugin["repository"] + "/releases/tag/" + tag
     body = f'''Adds **{plugin["name"]}** (`{plugin["id"]}`), a native Cursor provider for CPA.
@@ -66,7 +65,7 @@ Repository: {plugin["repository"]}
 Latest release: [{tag}]({release_url})
 
 Release assets (ZIP root contains `{plugin["id"]}.so`, `{plugin["id"]}.dylib` or `{plugin["id"]}.dll`):
-''' + "".join(f"\n- `{name}`" for name in names + ["checksums.txt"]) + '''
+''' + "".join(f"\n- `{name}`" for name in names) + '''
 
 Validation:
 - See the linked repository validation and compatibility documentation for tested behavior and limits.
@@ -90,7 +89,7 @@ This PR changes only `registry.json`.
     release = api(f"/repos/{owner_repo}/releases/latest", token)
     assert release["tag_name"] == tag and not release["draft"] and not release["prerelease"], "publish the matching stable release first"
     assets = {asset["name"]: asset for asset in release["assets"]}
-    for name in names + ["checksums.txt"]:
+    for name in names:
         assert name in assets and assets[name]["size"] > 0, f"missing release asset: {name}"
     checksum_url = assets["checksums.txt"]["browser_download_url"]
     assert checksum_url.startswith(plugin["repository"] + "/releases/download/"), "unexpected checksum download origin"
@@ -101,7 +100,7 @@ This PR changes only `registry.json`.
         match = re.fullmatch(r"([a-fA-F0-9]{64})  (.+)", line)
         assert match and match[2] not in entries, "invalid or duplicate checksum entry"
         entries[match[2]] = match[1]
-    assert set(entries) == set(names), "checksums must cover exactly the published platform ZIPs"
+    assert set(entries) == set(names) - {"checksums.txt"}, "checksums must cover exactly the published platform ZIPs and required provenance"
 
     user = api("/user", token)["login"]
     branch = f'add-cursor-next-v{plugin["version"]}-full-platform'

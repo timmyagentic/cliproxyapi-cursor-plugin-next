@@ -204,7 +204,7 @@ func TestNativeRetransmissionAndServerExecCancellation(t *testing.T) {
 		nativeWait(t, func() bool { return tr.closed.Load() == 1 })
 		before := len(tr.snapshot())
 		_, _, err := ns.Start(context.Background(), next)
-		if err == nil || errorStatus(err) != 409 || len(tr.snapshot()) != before || opens.Load() != 1 {
+		if err == nil || errorStatus(err) != 410 || len(tr.snapshot()) != before || opens.Load() != 1 {
 			t.Fatal("cancelled exec accepted late results")
 		}
 	})

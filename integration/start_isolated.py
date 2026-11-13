@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--proxy-config", type=Path)
     parser.add_argument("--transport", choices=("auto", "host", "native"), default="auto")
     parser.add_argument("--native-proxy-url", help="Explicit native transport proxy; never printed")
+    parser.add_argument("--recover-response-service-tier", action="store_true", help="Enable the candidate's opt-in workaround for a host translator that drops this field")
     parser.add_argument("--port", type=int, default=28347)
     args = parser.parse_args()
     if args.transport == "native" and not args.native_proxy_url:
@@ -70,6 +71,7 @@ def main():
             config["requests"]["proxy-url"] = proxy
     plugin_config = config["plugins"]["configs"]["cursor-next"]
     plugin_config["transport"] = args.transport
+    plugin_config["recover-response-service-tier"] = args.recover_response_service_tier
     if args.native_proxy_url:
         plugin_config["native-proxy-url"] = args.native_proxy_url
     config_path = root / "config.yaml"

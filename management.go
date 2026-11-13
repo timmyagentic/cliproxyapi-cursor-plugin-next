@@ -51,13 +51,9 @@ func (p *pluginRuntime) handleManagement(s *requestScope, req rpcRequest) (any, 
 	}
 	endpoint := base + "/plugins/" + pluginID + "/api-key"
 	if req.Method == http.MethodGet && req.Path == base+"/plugins/"+pluginID+"/accounting" {
-		// This authenticated management route exposes only health counters, not
-		// credentials, journal paths, event identities, or conversation contents.
-		p.mu.Lock()
-		health := p.journal.Health()
-		active := len(p.usageActive)
-		p.mu.Unlock()
-		return managementResponse(200, "application/json", encodeJSON(map[string]any{"journal": health, "active_runs": active, "version": version})), nil
+		// CPA authenticates this route. Diagnostics retain Run/context semantics
+		// without exposing identities or scanning the historical journal archive.
+		return managementResponse(200, "application/json", encodeJSON(p.accountingDiagnostics())), nil
 	}
 	if req.Method == http.MethodGet && req.Path == resource+"/login" {
 		var body bytes.Buffer
