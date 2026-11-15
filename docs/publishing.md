@@ -1,7 +1,7 @@
 # Publishing
 
 The independent plugin ID is `cursor-next`; the auth provider/model prefix stays
-`cursor`. Version 0.2.2 is the plugin-only hardening line. The withdrawn 0.2.1
+`cursor`. Version 0.2.3 adds the plugin-owned Run usage view to the plugin-only hardening line. The withdrawn 0.2.1
 cross-component proposal is not a release dependency; do not reuse its version.
 Source changes, a local installation and a public tagged release are separate
 states.
