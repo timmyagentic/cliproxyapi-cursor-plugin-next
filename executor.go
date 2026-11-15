@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -33,6 +34,9 @@ type runState struct {
 	seen                           map[string]string
 	internalCalls                  int
 	internalSteps                  int
+	toolChoice                     any
+	parallelToolCalls              *bool
+	toolEvents                     []runEvent
 }
 
 var maxModeRequired = regexp.MustCompile(`(?i)max[ _]mode[ _]required|requires max mode`)
@@ -62,6 +66,13 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 	if err := json.Unmarshal(req.Payload, &chat); err != nil || len(chat.Messages) == 0 {
 		return nil, failure(400, "Expected a nonempty Chat Completions messages array")
 	}
+	if err := p.recoverResponseServiceTier(req, &chat); err != nil {
+		return nil, err
+	}
+	tools, err := prepareTools(chat)
+	if err != nil {
+		return nil, err
+	}
 	model := req.Model
 	if model == "" {
 		model = chat.Model
@@ -80,15 +91,6 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 		p.mu.Unlock()
 	}
 	resolution := resolveModel(entries, model, chat.ReasoningEffort, chat.ServiceTier)
-	tools := toolsOf(chat)
-	conv, err := conversation(chat, tools)
-	if err != nil {
-		return nil, err
-	}
-	account := usageAccount(req, token)
-	identity := req
-	identity.AuthID = account
-	cid := conversationID(chat, identity)
 	sessions, release, err := p.nativeForRequest()
 	if err != nil {
 		return nil, err
@@ -99,6 +101,32 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 			release()
 		}
 	}()
+	nativeHandles := nativeTailHandles(chat.Messages)
+	if sessions == nil && len(nativeHandles) > 0 {
+		// Fail before importing/refetching history: an unavailable native owner
+		// cannot be recovered by replaying its tool results through host mode.
+		return nil, nativePermanentFailure("cursor_native_owner_unavailable", "native_transport_unavailable", "native session is unavailable for these tool-result handles")
+	}
+	var conv chatConversation
+	// Retained tool continuations use the original message identity and their
+	// native result encoder. Do not refetch historical URLs or rewrite that
+	// history while validating an already parked Run.
+	if !(sessions != nil && len(nativeHandles) > 0) {
+		var route *nativeTransportPool
+		if sessions != nil {
+			p.mu.Lock()
+			route = p.nativePool
+			p.mu.Unlock()
+		}
+		conv, err = s.prepareConversation(chat, tools, route)
+		if err != nil {
+			return nil, err
+		}
+	}
+	account := usageAccount(req, token)
+	identity := req
+	identity.AuthID = account
+	cid := conversationID(chat, identity)
 	var events <-chan runEvent
 	var first runEvent
 	var receipt *nativeReceipt
@@ -117,13 +145,7 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 		}
 		receipt = &r
 	} else {
-		// Do not turn a lost native owner into an unannounced tool replay.
-		for i := len(chat.Messages) - 1; i >= 0 && str(chat.Messages[i]["role"]) == "tool"; i-- {
-			if nativeHandlePattern.MatchString(str(chat.Messages[i]["tool_call_id"])) {
-				return nil, failure(409, "Native Cursor session is unavailable; start a new turn with complete history")
-			}
-		}
-		events = p.run(s, token, resolution, conv, tools, cid, account)
+		events = p.run(s, token, resolution, conv, tools, cid, account, chat)
 		var ok bool
 		first, ok = <-events
 		if !ok {
@@ -133,7 +155,7 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 			for range events {
 			}
 			resolution.Max = true
-			events = p.run(s, token, resolution, conv, tools, cid, account)
+			events = p.run(s, token, resolution, conv, tools, cid, account, chat)
 			first, ok = <-events
 		}
 		if !ok {
@@ -151,6 +173,17 @@ func (p *pluginRuntime) execute(s *requestScope, req rpcRequest, stream bool) (a
 		responseHeaders.Set("X-Cursor-Continuity", fmt.Sprintf("native; transport=%s; resumed=%t; replay=%t", receipt.Protocol, receipt.Resumed, receipt.Replay))
 		responseHeaders.Set("X-Cursor-Run-Id", receipt.RunID)
 		responseHeaders.Set("X-Cursor-Source-Format", nativeSourceFormat(req))
+		if !receipt.RunDeadline.IsZero() {
+			responseHeaders.Set("X-Cursor-Run-Expires-At", receipt.RunDeadline.UTC().Format(time.RFC3339Nano))
+		}
+		if receipt.ToolResultTimeoutSeconds > 0 {
+			responseHeaders.Set("X-Cursor-Tool-Result-Timeout-Seconds", strconv.Itoa(receipt.ToolResultTimeoutSeconds))
+		}
+		if receipt.PendingDeadline != nil {
+			if deadline := receipt.PendingDeadline(); !deadline.IsZero() {
+				responseHeaders.Set("X-Cursor-Tool-Result-Deadline", deadline.UTC().Format(time.RFC3339Nano))
+			}
+		}
 	}
 	if stream {
 		responseHeaders.Set("Content-Type", "text/event-stream")
@@ -315,7 +348,7 @@ func streamReply(s *requestScope, streamID string, events <-chan runEvent, first
 	}
 }
 
-func (p *pluginRuntime) run(s *requestScope, token string, model modelResolution, conv chatConversation, tools []chatTool, cid, account string) <-chan runEvent {
+func (p *pluginRuntime) run(s *requestScope, token string, model modelResolution, conv chatConversation, tools []chatTool, cid, account string, chat chatRequest) <-chan runEvent {
 	events := make(chan runEvent, 1)
 	go func() {
 		defer close(events)
@@ -458,7 +491,7 @@ func (p *pluginRuntime) run(s *requestScope, token string, model modelResolution
 			return
 		}
 		defer resp.Body.Close()
-		state := runState{tools: tools, blobs: blobs, seen: map[string]string{}}
+		state := runState{tools: tools, blobs: blobs, seen: map[string]string{}, toolChoice: chat.ToolChoice, parallelToolCalls: chat.ParallelToolCalls}
 		var terminal runEvent
 		err = state.decode(resp.Body, send, func(ev runEvent) bool {
 			// Close the upstream Run before looking up its dashboard event.
@@ -504,6 +537,28 @@ func (st *runState) finished() runEvent {
 	}
 	return runEvent{stop: stop, usage: usage, internalCalls: st.internalCalls, internalSteps: st.internalSteps}
 }
+
+func (st *runState) emitFinished(emit func(runEvent) bool) error {
+	if st.listed > 0 && st.calls+st.answered != st.listed {
+		return failure(502, "Cursor ended an incomplete declared tool batch")
+	}
+	calls := make([]map[string]any, 0, len(st.toolEvents))
+	for _, event := range st.toolEvents {
+		calls = append(calls, event.tool)
+	}
+	if err := validateToolOutputBatch(st.toolChoice, st.parallelToolCalls, st.tools, calls); err != nil {
+		return err
+	}
+	for _, event := range st.toolEvents {
+		if !emit(event) {
+			return context.Canceled
+		}
+	}
+	if !emit(st.finished()) {
+		return context.Canceled
+	}
+	return nil
+}
 func usageFromFields(fs []pbField) map[string]any {
 	// An empty/malformed usage update is unknown, not an exact zero count.
 	measured := false
@@ -534,8 +589,7 @@ func (st *runState) decode(reader io.Reader, send func([]byte) error, emit func(
 		data, end, err := readConnectFrame(reader)
 		if err != nil {
 			if errors.Is(err, io.EOF) && st.calls > 0 {
-				emit(st.finished())
-				return nil
+				return st.emitFinished(emit)
 			}
 			if errors.Is(err, io.EOF) {
 				return failure(502, "Cursor reply broke off before turn completion")
@@ -549,8 +603,7 @@ func (st *runState) decode(reader io.Reader, send func([]byte) error, emit func(
 			if st.wrote == 0 && st.calls == 0 {
 				return failure(502, "Cursor returned an empty reply")
 			}
-			emit(st.finished())
-			return nil
+			return st.emitFinished(emit)
 		}
 		fields, err := pbFields(data)
 		if err != nil {
@@ -587,8 +640,7 @@ func (st *runState) decode(reader io.Reader, send func([]byte) error, emit func(
 							if st.wrote == 0 {
 								return failure(502, "Cursor ended a turn without text or tool calls")
 							}
-							emit(st.finished())
-							return nil
+							return st.emitFinished(emit)
 						}
 					case 27:
 						n := pbNum(fs, 1)
@@ -609,9 +661,7 @@ func (st *runState) decode(reader io.Reader, send func([]byte) error, emit func(
 				if call != nil {
 					call["index"] = st.calls
 					st.calls++
-					if !emit(runEvent{tool: call}) {
-						return context.Canceled
-					}
+					st.toolEvents = append(st.toolEvents, runEvent{tool: call})
 				} else if counted {
 					st.answered++
 					st.internalCalls++
@@ -648,8 +698,7 @@ func (st *runState) decode(reader io.Reader, send func([]byte) error, emit func(
 			}
 			if done() {
 				if st.calls > 0 {
-					emit(st.finished())
-					return nil
+					return st.emitFinished(emit)
 				}
 				st.listed = 0
 				st.answered = 0
@@ -693,8 +742,11 @@ func (st *runState) exec(data []byte, send func([]byte) error) (map[string]any, 
 				name = strings.TrimPrefix(pbText(argsFields, 1), "magpie-")
 			}
 			allowed := false
+			var selected chatTool
 			for _, t := range st.tools {
-				allowed = allowed || t.Name == name
+				if t.Name == name {
+					allowed, selected = true, t
+				}
 			}
 			provider, server := pbText(argsFields, 4), pbText(argsFields, 9)
 			if !allowed || provider != "" && provider != "magpie" || server != "" && server != "magpie" || pbGet(argsFields, 6) != nil || pbNum(argsFields, 7) != 0 {
@@ -721,6 +773,9 @@ func (st *runState) exec(data []byte, send func([]byte) error) (map[string]any, 
 					}
 				}
 				args[key] = value
+			}
+			if err := validateToolArguments(selected, args); err != nil {
+				return nil, false, err
 			}
 			callID := strings.ReplaceAll(pbText(argsFields, 3), "\n", "__")
 			if callID == "" {

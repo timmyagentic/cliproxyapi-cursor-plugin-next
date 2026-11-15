@@ -33,6 +33,9 @@ type nativeReceipt struct {
 	Started                                           time.Time
 	Resumed, Replay                                   bool
 	Delivered                                         func() `json:"-"`
+	RunDeadline                                       time.Time
+	ToolResultTimeoutSeconds                          int
+	PendingDeadline                                   func() time.Time `json:"-"`
 	token                                             string
 }
 
@@ -47,15 +50,16 @@ func defaultNativeLimits() nativeLimits {
 }
 
 type nativeSessions struct {
-	mu      sync.Mutex
-	wg      sync.WaitGroup
-	closing bool
-	ctx     context.Context
-	cancel  context.CancelFunc
-	open    func(context.Context, string, string, string, []byte) (cursorRunTransport, error)
-	limits  nativeLimits
-	entries map[string]*nativeSession
-	handles map[string]*nativeSegment
+	mu       sync.Mutex
+	wg       sync.WaitGroup
+	closing  bool
+	ctx      context.Context
+	cancel   context.CancelFunc
+	open     func(context.Context, string, string, string, []byte) (cursorRunTransport, error)
+	limits   nativeLimits
+	entries  map[string]*nativeSession
+	handles  map[string]*nativeSegment
+	failures map[string]nativeFailureRecord
 	// Hooks are configured before the first Start. They must not retain a
 	// requestScope. OnStart admits one physical Run before opening it. OnEnd
 	// runs once after transport closure and before the final segment is closed.
@@ -76,6 +80,7 @@ type nativeSegment struct {
 	detach             func() bool
 	caller             context.Context
 	resultDigest       string
+	policyDigest       string
 	next               *nativeSegment
 	deadline           time.Time
 }
@@ -96,6 +101,9 @@ type nativeSession struct {
 	contract, identity                                      string
 	ownerScope                                              string
 	tools                                                   []chatTool
+	nativeTools                                             map[string]string
+	toolChoice                                              any
+	parallelToolCalls                                       *bool
 	segment                                                 *nativeSegment
 	segments                                                []*nativeSegment
 	execs                                                   map[uint64]*nativeCall
@@ -164,16 +172,25 @@ func (ns *nativeSessions) worker(fn func()) bool {
 }
 
 func (ns *nativeSessions) forget(s *nativeSession) {
+	s.mu.Lock()
+	err, identity := s.err, s.identity
+	scope := nativeOwnerKey(s.receipt.Account, s.ownerScope)
+	s.mu.Unlock()
 	ns.mu.Lock()
 	if ns.entries[s.receipt.RunID] != s {
 		ns.mu.Unlock()
 		return
 	}
 	delete(ns.entries, s.receipt.RunID)
+	hadHandles := false
 	for id, seg := range ns.handles {
 		if seg.owner == s {
+			hadHandles = true
 			delete(ns.handles, id)
 		}
+	}
+	if err != nil && hadHandles {
+		ns.rememberFailureLocked(identity, scope, nativeFailureDetails(err), time.Now())
 	}
 	ns.mu.Unlock()
 	s.mu.Lock()
@@ -194,7 +211,7 @@ func (ns *nativeSessions) Close() error {
 	}
 	ns.mu.Unlock()
 	for _, s := range all {
-		s.finish(failure(409, "native session store shut down"), runEvent{})
+		s.finish(nativePermanentFailure("cursor_native_owner_unavailable", "plugin_shutdown", "native session store shut down"), runEvent{})
 	}
 	for _, s := range all {
 		<-s.endDone
@@ -213,7 +230,7 @@ func (ns *nativeSessions) Start(ctx context.Context, in nativeInput) (<-chan run
 		return nil, nativeReceipt{}, err
 	}
 	if err := ns.ctx.Err(); err != nil {
-		return nil, nativeReceipt{}, failure(409, "native session store is closed")
+		return nil, nativeReceipt{}, nativePermanentFailure("cursor_native_owner_unavailable", "plugin_shutdown", "native session store is closed")
 	}
 	if len(in.Chat.Messages) == 0 || in.Account == "" {
 		return nil, nativeReceipt{}, failure(400, "native session requires messages and account identity")
@@ -234,14 +251,14 @@ func (ns *nativeSessions) Start(ctx context.Context, in nativeInput) (<-chan run
 		}
 		ns.mu.Unlock()
 		if seg == nil {
-			return nil, nativeReceipt{}, failure(409, "native continuation owner is unavailable or expired")
+			return nil, nativeReceipt{}, ns.unavailableOwner(in, ids)
 		}
 		return seg.owner.resume(ctx, in, contract, seg)
 	}
 	// A result carrying a native ID outside the complete trailing batch must
 	// not be silently imported into a new Run as if it were fresh input.
 	if nativeTailAssistant(in.Chat.Messages) {
-		return nil, nativeReceipt{}, failure(409, "native continuation has no complete correlated result batch")
+		return nil, nativeReceipt{}, nativeContinuationFailure("cursor_native_context_changed", "incomplete_results", "native continuation has no complete correlated result batch")
 	}
 	prefix, err := nativeHistoryDigest(in.Chat.Messages)
 	if err != nil {
@@ -260,13 +277,17 @@ func (ns *nativeSessions) Start(ctx context.Context, in nativeInput) (<-chan run
 	}
 	now := time.Now()
 	runCtx, cancel := context.WithCancel(ns.ctx)
-	s := &nativeSession{pool: ns, ctx: runCtx, cancel: cancel, limits: ns.limits, contract: contract, identity: strings.ReplaceAll(randomID(), "-", ""), tools: nativeCloneTools(in.Tools), execs: map[uint64]*nativeCall{}, seenExecs: map[uint64]string{}, internalReplies: map[uint64][][]byte{}, nativeIDs: map[string]uint64{}, blobs: blobs, bootstrap: map[string]bool{}, blobBytes: blobBytes, state: "opening", started: now, expires: now.Add(ns.limits.Lifetime), workDone: make(chan struct{}), endDone: make(chan struct{}), internalSteps: 1, admissionDone: make(chan struct{})}
+	s := &nativeSession{pool: ns, ctx: runCtx, cancel: cancel, limits: ns.limits, contract: contract, identity: strings.ReplaceAll(randomID(), "-", ""), nativeTools: map[string]string{}, execs: map[uint64]*nativeCall{}, seenExecs: map[uint64]string{}, internalReplies: map[uint64][][]byte{}, nativeIDs: map[string]uint64{}, blobs: blobs, bootstrap: map[string]bool{}, blobBytes: blobBytes, state: "opening", started: now, expires: now.Add(ns.limits.Lifetime), workDone: make(chan struct{}), endDone: make(chan struct{}), internalSteps: 1, admissionDone: make(chan struct{})}
 	s.ownerScope = in.OwnerScope
+	for _, tool := range in.Tools {
+		s.nativeTools[tool.Name] = nativeToolSchemaDigest(tool)
+	}
+	s.setToolPolicy(in)
 	s.receipt = nativeReceipt{RunID: randomID(), CID: in.CID, RequestID: randomID(), Account: in.Account, ModelID: in.Model.ID, Started: now, token: in.Token}
 	for k := range blobs {
 		s.bootstrap[k] = true
 	}
-	seg := &nativeSegment{owner: s, prefixLength: len(in.Chat.Messages), prefixDigest: prefix, notify: make(chan struct{})}
+	seg := &nativeSegment{owner: s, prefixLength: len(in.Chat.Messages), prefixDigest: prefix, policyDigest: nativePolicyDigest(in.Chat), notify: make(chan struct{})}
 	s.segment = seg
 	s.segments = []*nativeSegment{seg}
 	// Evict only terminal replay owners, only under capacity pressure. Do not
@@ -323,7 +344,9 @@ func (ns *nativeSessions) Start(ctx context.Context, in nativeInput) (<-chan run
 	}
 	s.attach(ctx, seg)
 	s.mu.Lock()
-	s.lifetimeTimer = time.AfterFunc(s.limits.Lifetime, func() { s.finish(failure(409, "native Run lifetime expired"), runEvent{}) })
+	s.lifetimeTimer = time.AfterFunc(time.Until(s.expires), func() {
+		s.finish(nativePermanentFailure("cursor_native_deadline", "run_lifetime", "native Run lifetime expired"), runEvent{})
+	})
 	s.mu.Unlock()
 	tr, err := ns.open(s.ctx, in.Account, in.Token, s.receipt.RequestID, first)
 	if err != nil {
@@ -333,21 +356,25 @@ func (ns *nativeSessions) Start(ctx context.Context, in nativeInput) (<-chan run
 	}
 	s.mu.Lock()
 	if s.state == "finishing" || s.state == "complete" || s.state == "failed" {
+		ended := s.err
 		s.mu.Unlock()
 		_ = tr.Close()
 		s.workOnce.Do(func() { close(s.workDone) })
-		return nil, nativeReceipt{}, failure(409, "native Run cancelled while opening")
+		if ended != nil {
+			return nil, nativeReceipt{}, ended
+		}
+		return nil, nativeReceipt{}, nativePermanentFailure("cursor_native_owner_unavailable", "owner_ended", "native Run cancelled while opening")
 	}
 	s.transport = tr
 	s.receipt.Protocol = tr.Protocol()
 	s.state = "running"
-	receipt := s.receipt
+	receipt := s.receiptFor(seg)
 	s.mu.Unlock()
 	receipt.Delivered = func() { s.delivered(seg) }
 	if !ns.worker(s.pump) {
-		s.finish(failure(409, "native session store shut down while opening"), runEvent{})
+		s.finish(nativePermanentFailure("cursor_native_owner_unavailable", "plugin_shutdown", "native session store shut down while opening"), runEvent{})
 		s.workOnce.Do(func() { close(s.workDone) })
-		return nil, nativeReceipt{}, failure(409, "native session store is closed")
+		return nil, nativeReceipt{}, nativePermanentFailure("cursor_native_owner_unavailable", "plugin_shutdown", "native session store is closed")
 	}
 	ns.worker(s.watch)
 	return s.subscribe(ctx, seg, false), receipt, nil
@@ -398,7 +425,7 @@ func (ns *nativeSessions) supersedeParked(ctx context.Context, in nativeInput) e
 	if owner == nil {
 		return nil
 	}
-	retired := owner.finishIf(failure(409, "native parked Run superseded by a new user turn"), runEvent{}, func() bool {
+	retired := owner.finishIf(nativePermanentFailure("cursor_native_owner_unavailable", "superseded_by_new_turn", "native parked Run superseded by a new user turn"), runEvent{}, func() bool {
 		return ctx.Err() == nil && ns.ctx.Err() == nil && owner.state == "parked" && owner.segment == batch && batch.closed && batch.delivered
 	})
 	owner.mu.Lock()
@@ -410,7 +437,7 @@ func (ns *nativeSessions) supersedeParked(ctx context.Context, in nativeInput) e
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ns.ctx.Done():
-			return failure(409, "native session store is closed")
+			return nativePermanentFailure("cursor_native_owner_unavailable", "plugin_shutdown", "native session store is closed")
 		}
 	}
 	return ctx.Err()
@@ -425,7 +452,7 @@ func (s *nativeSession) attach(ctx context.Context, seg *nativeSegment) {
 		clean := seg.delivered
 		s.mu.Unlock()
 		if !clean {
-			s.finish(failure(409, "native caller cancelled before response delivery"), runEvent{})
+			s.finish(nativeContinuationFailure("cursor_native_cancelled", "caller_cancelled", "native caller cancelled before response delivery"), runEvent{})
 		}
 	})
 	s.mu.Lock()
@@ -440,7 +467,7 @@ func (s *nativeSession) delivered(seg *nativeSegment) {
 	s.mu.Lock()
 	if !seg.delivered && seg.caller != nil && seg.caller.Err() != nil {
 		s.mu.Unlock()
-		s.finish(failure(409, "native caller cancelled before response delivery"), runEvent{})
+		s.finish(nativeContinuationFailure("cursor_native_cancelled", "caller_cancelled", "native caller cancelled before response delivery"), runEvent{})
 		return
 	}
 	seg.delivered = true
@@ -526,25 +553,42 @@ func (s *nativeSession) resume(ctx context.Context, in nativeInput, contract str
 	s.mu.Lock()
 	if s.contract != contract || s.receipt.Account != in.Account {
 		s.mu.Unlock()
-		return nil, nativeReceipt{}, failure(409, "native continuation account, model, or executable tool contract changed")
+		return nil, nativeReceipt{}, nativeContinuationFailure("cursor_native_context_changed", "contract_changed", "native continuation account, model, or executable tool contract changed")
+	}
+	if s.state == "finishing" && s.err == nil {
+		s.mu.Unlock()
+		return nil, nativeReceipt{}, failure(409, "native owner is completing its response; wait for delivery before retrying")
 	}
 	if s.state == "failed" || s.state == "finishing" || time.Now().After(s.expires) {
+		first := s.err
 		s.mu.Unlock()
-		return nil, nativeReceipt{}, failure(409, "native continuation expired or failed")
+		if first != nil {
+			return nil, nativeReceipt{}, nativeLostOwner(nativeFailureDetails(first))
+		}
+		return nil, nativeReceipt{}, nativePermanentFailure("cursor_native_owner_unavailable", "owner_ended", "native continuation expired or failed")
 	}
 	results, d, err := nativeMatchResults(batch, in.Chat.Messages, s.limits, in.SourceFormat)
 	if err != nil {
 		s.mu.Unlock()
-		return nil, nativeReceipt{}, err
+		// nativeMatchResults emits only fixed diagnostics and structural sizes,
+		// never the caller's history, tool arguments or result content.
+		return nil, nativeReceipt{}, nativeContinuationFailure("cursor_native_context_changed", "history_or_results_changed", err.Error())
 	}
-	receipt := s.receipt
+	policyDigest := nativePolicyDigest(in.Chat)
+	receipt := s.receiptFor(batch)
 	receipt.Resumed = true
 	if batch.resultDigest != "" {
 		if batch.resultDigest != d || batch.next == nil || !batch.next.closed || !batch.next.delivered {
 			s.mu.Unlock()
 			return nil, nativeReceipt{}, failure(409, "native results already reserved, different, or still in flight")
 		}
+		if batch.next.policyDigest != policyDigest {
+			s.mu.Unlock()
+			return nil, nativeReceipt{}, failure(409, "native results were already submitted under a different output policy; do not resubmit them")
+		}
 		next := batch.next
+		receipt = s.receiptFor(next)
+		receipt.Resumed = true
 		receipt.Replay = true
 		receipt.Delivered = func() { s.delivered(next) }
 		s.mu.Unlock()
@@ -556,20 +600,27 @@ func (s *nativeSession) resume(ctx context.Context, in nativeInput, contract str
 	}
 	if !time.Now().Before(batch.deadline) {
 		s.mu.Unlock()
-		return nil, nativeReceipt{}, failure(409, "native tool-result deadline expired")
+		return nil, nativeReceipt{}, nativePermanentFailure("cursor_native_deadline", "tool_result_timeout", "native tool-result deadline expired")
 	}
-	if time.Until(s.expires) <= min(time.Minute, s.limits.Lifetime/10) {
+	if time.Until(s.expires) <= nativeResumeBuffer(s.limits.Lifetime) {
 		s.mu.Unlock()
-		return nil, nativeReceipt{}, failure(409, "native Run is near its lifetime deadline")
+		return nil, nativeReceipt{}, nativePermanentFailure("cursor_native_deadline", "run_lifetime", "native Run is near its lifetime deadline")
+	}
+	if err := s.checkToolPolicy(in); err != nil {
+		s.mu.Unlock()
+		return nil, nativeReceipt{}, err
 	}
 	prefix, err := nativeHistoryDigest(in.Chat.Messages)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, nativeReceipt{}, err
 	}
-	next := &nativeSegment{owner: s, prefixLength: len(in.Chat.Messages), prefixDigest: prefix, notify: make(chan struct{})}
+	next := &nativeSegment{owner: s, prefixLength: len(in.Chat.Messages), prefixDigest: prefix, policyDigest: policyDigest, notify: make(chan struct{})}
+	receipt = s.receiptFor(next)
+	receipt.Resumed = true
 	batch.resultDigest = d
 	batch.next = next
+	s.setToolPolicy(in)
 	s.segment = next
 	s.segments = append(s.segments, next)
 	s.turn++
@@ -597,11 +648,11 @@ func (s *nativeSession) resume(ctx context.Context, in nativeInput, contract str
 			r.call.submitted = true
 			s.mu.Unlock()
 			if err := s.send(protobuf(nil).bytes(2, msg)); err != nil {
-				s.finish(preserveRetryHint(err, failure(errorStatus(err), "native result submission failed; outcome uncertain, cannot resubmit")), runEvent{})
+				s.finish(nativeUncertainSubmission(err, "native result submission failed; outcome uncertain, cannot resubmit"), runEvent{})
 				return
 			}
 			if err := s.send(nativeExecClose(r.call.RequestID)); err != nil {
-				s.finish(preserveRetryHint(err, failure(errorStatus(err), "native result close failed; outcome uncertain, cannot resubmit")), runEvent{})
+				s.finish(nativeUncertainSubmission(err, "native result close failed; outcome uncertain, cannot resubmit"), runEvent{})
 				return
 			}
 		}
@@ -613,8 +664,8 @@ func (s *nativeSession) resume(ctx context.Context, in nativeInput, contract str
 		}
 		s.mu.Unlock()
 	}) {
-		s.finish(failure(409, "native session store closed before submitting results"), runEvent{})
-		return nil, nativeReceipt{}, failure(409, "native session store is closed")
+		s.finish(nativePermanentFailure("cursor_native_owner_unavailable", "plugin_shutdown", "native session store closed before submitting results"), runEvent{})
+		return nil, nativeReceipt{}, nativePermanentFailure("cursor_native_owner_unavailable", "plugin_shutdown", "native session store is closed")
 	}
 	return s.subscribe(ctx, next, false), receipt, nil
 }
@@ -649,6 +700,7 @@ func (s *nativeSession) finishIf(err error, end runEvent, check func() bool) boo
 	}
 	s.state = "finishing"
 	defer s.endOnce.Do(func() { close(s.endDone) })
+	err = nativeRecoveryRequired(err)
 	s.err = err
 	for _, timer := range []*time.Timer{s.lifetimeTimer, s.pendingTimer, s.batchTimer, s.replayTimer} {
 		if timer != nil {
@@ -681,6 +733,9 @@ func (s *nativeSession) finishIf(err error, end runEvent, check func() bool) boo
 	s.bootstrap = nil
 	s.checkpoint = nil
 	s.tools = nil
+	s.nativeTools = nil
+	s.toolChoice = nil
+	s.parallelToolCalls = nil
 	s.seenExecs = nil
 	s.internalReplies = nil
 	s.nativeIDs = nil
@@ -730,7 +785,9 @@ func (s *nativeSession) pump() {
 		}
 		if end {
 			if err = connectError(200, data); err == nil {
-				err = failure(502, "native stream ended before TurnEnded")
+				err = nativeFailure(502, "cursor_native_transport_error", "stream_read/early_end", "native stream ended before TurnEnded")
+			} else {
+				err = nativeFailure(errorStatus(err), "cursor_native_upstream_error", "connect_stream_error", "Native Cursor Connect stream returned an error")
 			}
 			s.finish(err, runEvent{})
 			return
@@ -743,7 +800,12 @@ func (s *nativeSession) pump() {
 		if terminal {
 			s.mu.Lock()
 			u := s.usage
+			toolErr := validateToolOutputBatch(s.toolChoice, s.parallelToolCalls, s.tools, nil)
 			s.mu.Unlock()
+			if toolErr != nil {
+				s.finish(nativeFailure(errorStatus(toolErr), "cursor_native_tool_output_invalid", "tool_contract", toolErr.Error()), runEvent{})
+				return
+			}
 			s.finish(nil, runEvent{stop: "stop", usage: u})
 			return
 		}
@@ -767,7 +829,7 @@ func (s *nativeSession) watch() {
 		case <-s.ctx.Done():
 			return
 		case <-tick.C:
-			if s.finishIf(failure(502, "Cursor went quiet while native inference was pending"), runEvent{}, func() bool {
+			if s.finishIf(nativeFailure(502, "cursor_native_transport_error", "upstream_wait/idle_timeout", "Cursor went quiet while native inference was pending"), runEvent{}, func() bool {
 				gap := time.Since(s.waitSince)
 				return s.waiting && (s.state == "running" || s.state == "submitting") && (gap >= s.limits.Idle || s.heard+gap >= s.limits.Quiet)
 			}) {
@@ -841,18 +903,13 @@ func nativeContract(in nativeInput) string {
 		return params[i].ID < params[j].ID
 	})
 	tools := []any{}
-	for _, t := range in.Tools {
-		strict := false
-		for _, raw := range in.Chat.Tools {
-			f := object(raw["function"])
-			if str(f["name"]) == t.Name {
-				strict, _ = f["strict"].(bool)
-			}
-		}
-		tools = append(tools, map[string]any{"name": t.Name, "schema": nativeSchemaContract(t.Schema, false), "strict": strict})
+	declared := in.Chat
+	declared.ToolChoice = nil
+	for _, tool := range toolsOf(declared) {
+		tools = append(tools, nativeToolSchemaIdentity(tool))
 	}
 	sort.Slice(tools, func(i, j int) bool { return str(object(tools[i])["name"]) < str(object(tools[j])["name"]) })
-	return digest(string(encodeJSON(map[string]any{"account": in.Account, "owner_scope": in.OwnerScope, "source_format": in.SourceFormat, "model": in.Model.ID, "max": in.Model.Max, "params": params, "tools": tools, "choice": in.Chat.ToolChoice})))
+	return digest(string(encodeJSON(map[string]any{"account": in.Account, "owner_scope": in.OwnerScope, "source_format": in.SourceFormat, "model": in.Model.ID, "max": in.Model.Max, "params": params, "tools": tools})))
 }
 func nativeSchemaContract(v any, names bool) any {
 	switch x := v.(type) {

@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const version = "0.2.0"
+const version = "0.2.3"
 const pluginID = "cursor-next"
 const pluginLogo = "https://raw.githubusercontent.com/timmyagentic/cliproxyapi-cursor-plugin-next/main/assets/cursor.png"
 const cursorAPI = "https://api2.cursor.sh"
@@ -77,7 +77,11 @@ func errorEnvelope(err error) []byte {
 }
 
 func pluginErrorDetail(err error) *rpcError {
-	return &rpcError{Code: "cursor_error", Message: err.Error(), HTTPStatus: errorStatus(err), RetryAfterSeconds: retryAfterSeconds(err)}
+	code := nativeErrorCode(err)
+	if code == "" {
+		code = "cursor_error"
+	}
+	return &rpcError{Code: code, Message: err.Error(), HTTPStatus: errorStatus(err), RetryAfterSeconds: retryAfterSeconds(err)}
 }
 
 type rpcRequest struct {
@@ -134,29 +138,30 @@ func parseRequest(raw []byte, method string) (rpcRequest, error) {
 }
 
 type pluginRuntime struct {
-	ctx            context.Context
-	cancel         context.CancelFunc
-	mu             sync.Mutex
-	closed         bool
-	scopes         map[*requestScope]struct{}
-	logins         map[string]*loginFlow
-	managementBase string
-	resourceBase   string
-	models         map[string]modelCache
-	keys           map[string]keyCache
-	now            func() time.Time
-	usagePolicy    stepUsagePolicy
-	journal        *usageJournal
-	journalErr     error
-	usageActive    map[string]bool
-	usageRuns      sync.WaitGroup
-	streamWorkers  sync.WaitGroup
-	journalPath    string
-	reconciling    map[string]bool
-	nativeConfig   nativeConfig
-	nativePool     *nativeTransportPool
-	nativeSessions *nativeSessions
-	nativeRequests int
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	mu                  sync.Mutex
+	closed              bool
+	scopes              map[*requestScope]struct{}
+	logins              map[string]*loginFlow
+	managementBase      string
+	resourceBase        string
+	models              map[string]modelCache
+	keys                map[string]keyCache
+	now                 func() time.Time
+	usagePolicy         stepUsagePolicy
+	journal             *usageJournal
+	journalErr          error
+	usageActive         map[string]bool
+	usageRuns           sync.WaitGroup
+	streamWorkers       sync.WaitGroup
+	journalPath         string
+	reconciling         map[string]bool
+	nativeConfig        nativeConfig
+	recoverResponseTier bool
+	nativePool          *nativeTransportPool
+	nativeSessions      *nativeSessions
+	nativeRequests      int
 }
 
 func newRuntime() *pluginRuntime {
@@ -240,7 +245,7 @@ func dispatch(p *pluginRuntime, method string, raw json.RawMessage, host hostCal
 			value = registration()
 		}
 	case "plugin.license":
-		value = map[string]any{"license": distributionLicense, "notice": distributionNotice, "third_party": map[string]string{"gopkg.in/yaml.v3": yamlLicense, "Apache-2.0": apacheLicense}}
+		value = map[string]any{"license": distributionLicense, "notice": distributionNotice, "third_party": map[string]string{"gopkg.in/yaml.v3": yamlLicense, "github.com/santhosh-tekuri/jsonschema/v5": apacheLicense, "Apache-2.0": apacheLicense}}
 	case "executor.identifier", "auth.identifier", "quota.identifier":
 		value = map[string]any{"identifier": "cursor"}
 	case "plugin.quiesce":

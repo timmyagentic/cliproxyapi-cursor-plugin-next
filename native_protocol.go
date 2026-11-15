@@ -263,6 +263,16 @@ func (s *nativeSession) sealLocked() error {
 		s.internalSteps++
 		return nil
 	}
+	calls := make([]map[string]any, 0, len(seg.calls))
+	for _, call := range seg.calls {
+		calls = append(calls, map[string]any{"id": call.ID, "type": "function", "function": map[string]any{"name": call.Name, "arguments": call.Args}})
+	}
+	if err := validateToolOutputBatch(s.toolChoice, s.parallelToolCalls, s.tools, calls); err != nil {
+		return nativeFailure(errorStatus(err), "cursor_native_tool_output_invalid", "tool_contract", err.Error())
+	}
+	if err := s.armPendingDeadlineLocked(seg); err != nil {
+		return err
+	}
 	s.state = "parked"
 	s.heard = 0
 	// Register before exposing the handoff. Pool operations never hold their
@@ -284,10 +294,6 @@ func (s *nativeSession) sealLocked() error {
 	}
 	seg.closed = true
 	s.wakeLocked(seg)
-	seg.deadline = time.Now().Add(s.limits.PendingTTL)
-	s.pendingTimer = time.AfterFunc(s.limits.PendingTTL, func() {
-		s.finishIf(failure(409, "native tool-result deadline expired"), runEvent{}, func() bool { return s.state == "parked" && s.segment == seg && seg.resultDigest == "" })
-	})
 	return nil
 }
 
@@ -532,7 +538,7 @@ func (s *nativeSession) handleFrame(data []byte) (bool, error) {
 							return e
 						}
 						if call := s.execs[pbNum(cf, 1)]; call != nil && !call.submitted {
-							return failure(409, "Cursor cancelled a pending native exec; late results cannot be submitted")
+							return nativeFailure(409, "cursor_native_cancelled", "upstream_cancelled", "Cursor cancelled a pending native exec; late results cannot be submitted")
 						}
 					}
 				}
@@ -547,7 +553,7 @@ func (s *nativeSession) handleFrame(data []byte) (bool, error) {
 		}
 		return nil
 	}
-	err = process()
+	err = nativeProtocolValidationError(process())
 	if !heartbeatOnly {
 		s.heard = 0
 	}

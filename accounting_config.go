@@ -28,6 +28,9 @@ func accountingConfigFields() []any {
 	return []any{
 		map[string]any{"Name": "transport", "Type": "string", "Default": "auto", "Description": "auto uses native sessions when native-proxy-url is explicit; host keeps CPA HTTP; native requires explicit proxy configuration."},
 		map[string]any{"Name": "native-proxy-url", "Type": "string", "Default": "", "Description": "Explicit native Run proxy: direct, http://, https://, socks5:// or socks5h://. Empty retains CPA host transport. Match the host's approved route; never inferred."},
+		map[string]any{"Name": "native-tool-result-timeout-seconds", "Type": "integer", "Default": 120, "Description": "Bounded native tool-result wait, 15–900 seconds and shorter than native-run-lifetime-seconds. The advertised handoff deadline also respects the remaining Run lifetime."},
+		map[string]any{"Name": "native-run-lifetime-seconds", "Type": "integer", "Default": 900, "Description": "Bounded native Run lifetime, 60–3600 seconds. This is a local limit, not a promise that the upstream can resume after expiry or restart."},
+		map[string]any{"Name": "recover-response-service-tier", "Type": "boolean", "Default": false, "Description": "Opt in only when the CPA Responses translator drops service_tier. Recover an absent field from OriginalRequest; an effective payload value always wins. Do not enable with a host policy that intentionally removes this field."},
 		map[string]any{"Name": "usage-journal", "Type": "string", "Default": "", "Description": "Absolute JSON path in a private directory. Enables durable, separate usage reconciliation; empty uses memory only."},
 		map[string]any{"Name": "usage-wait-ms", "Type": "integer", "Default": 8000, "Description": "Bounded wait for the current Run's measured dashboard usage (3000–30000 ms). Missing usage is omitted, never estimated."},
 	}
@@ -39,8 +42,9 @@ func (p *pluginRuntime) configureAccounting(raw []byte) error {
 		return err
 	}
 	var cfg struct {
-		Journal string `yaml:"usage-journal"`
-		Wait    *int   `yaml:"usage-wait-ms"`
+		Journal             string `yaml:"usage-journal"`
+		Wait                *int   `yaml:"usage-wait-ms"`
+		RecoverResponseTier bool   `yaml:"recover-response-service-tier"`
 	}
 	if len(raw) > 64<<10 || yaml.Unmarshal(raw, &cfg) != nil {
 		return failure(400, "Invalid Cursor accounting configuration")
@@ -90,5 +94,9 @@ func (p *pluginRuntime) configureAccounting(raw []byte) error {
 		return failure(503, "Cursor usage journal is unavailable")
 	}
 	p.usagePolicy = policy
-	return p.configureNativeLocked(native)
+	if err := p.configureNativeLocked(native); err != nil {
+		return err
+	}
+	p.recoverResponseTier = cfg.RecoverResponseTier
+	return nil
 }

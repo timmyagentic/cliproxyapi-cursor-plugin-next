@@ -108,6 +108,14 @@ func TestReferenceConversationParity(t *testing.T) {
 	for i, c := range referenceFixtures(t).Conversations {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
 			conv, err := conversation(c.Chat, toolsOf(c.Chat))
+			// The old fixture included a remote URL and a filename without data;
+			// treating those as successful image/file reads was intentionally removed.
+			if i == 5 {
+				if errorStatus(err) != 400 {
+					t.Fatalf("legacy attachment placeholders must be rejected without a fetch route: %v", err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}

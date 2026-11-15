@@ -13,7 +13,37 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
+
+func TestNativeExecutorExposesRunDeadlineWithoutWaitingForToolHandoff(t *testing.T) {
+	p := newTestRuntime(t)
+	ns, tr, _ := nativeTestPool(t)
+	p.nativeSessions = ns
+	host := newSyntheticHost(t, "native-deadline-context")
+	tr.push(nativeTestFinal("complete"))
+	result := invokeNative(t, p, "executor.execute", map[string]any{
+		"host_callback_id": host.context, "StorageJSON": syntheticCredentials(),
+		"Format": "openai", "Model": "cursor/fixture-model", "AuthID": "synthetic",
+		"Payload": encodeJSON(map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hello"}}}),
+	}, host.call)
+	if result["ok"] != true {
+		t.Fatalf("native execution failed: %v", result)
+	}
+	headers := object(object(result["result"])["Headers"])
+	values := array(headers["X-Cursor-Run-Expires-At"])
+	if len(values) != 1 {
+		t.Fatal("native response did not expose its Run expiry")
+	}
+	expires, err := time.Parse(time.RFC3339Nano, str(values[0]))
+	if err != nil || !expires.After(time.Now()) {
+		t.Fatalf("invalid Run expiry: %v", err)
+	}
+	values = array(headers["X-Cursor-Tool-Result-Timeout-Seconds"])
+	if len(values) != 1 || str(values[0]) != "120" {
+		t.Fatal("tool wait configuration was not exposed independently of a handoff")
+	}
+}
 
 func TestExecutorChatCompletionsFormatCompatibility(t *testing.T) {
 	for _, format := range []string{"", "openai", "chat-completions", "chat_completions", "openai-chat-completions", "openai_chat_completions", " OpenAI "} {

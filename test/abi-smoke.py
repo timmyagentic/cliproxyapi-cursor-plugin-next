@@ -111,6 +111,15 @@ try:
     page = call("management.handle", {"Method": "GET", "Path": routes["resources"][0]["Path"]})["result"]
     assert page["StatusCode"] == 200
     assert b'Cursor API Key' in base64.b64decode(page["Body"])
+    usage_resource = next(item for item in routes["resources"] if item["Menu"] == "Cursor 用量")
+    usage_page = call("management.handle", {"Method": "GET", "Path": usage_resource["Path"]})["result"]
+    assert usage_page["StatusCode"] == 200
+    assert b'accounting/runs' in base64.b64decode(usage_page["Body"])
+    usage_route = next(item for item in routes["routes"] if item["Path"].endswith("/accounting/runs"))
+    usage_reply = call("management.handle", {"Method": "GET", "Path": usage_route["Path"]})["result"]
+    usage_view = json.loads(base64.b64decode(usage_reply["Body"]))
+    assert usage_view["scope"] == "run" and usage_view["context_usage"] == "unavailable"
+    assert usage_view["limit"] == 200 and usage_view["rows"] == []
     assert registered["result"]["metadata"]["Version"] == json.loads((Path(__file__).resolve().parents[1] / "registry.json").read_text())["plugins"][0]["version"]
     assert "magpie-community contributors" in call("plugin.license", {})["result"]["license"]
     assert call("quota.identifier", {})["result"]["identifier"] == "cursor"

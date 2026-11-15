@@ -13,6 +13,10 @@ MIT and Apache-2.0 terms. Its notices and the Apache license are preserved in
 `third_party/` and embedded in the distributed library. See `plugin.license`
 for the binary's license/notice texts.
 
+Strict tool argument validation uses `github.com/santhosh-tekuri/jsonschema/v5`
+v5.3.1 under Apache-2.0. The Apache license is embedded in the library and is
+available through `plugin.license` under the dependency's module name.
+
 The native implementation is based on the Cursor protocol, authentication,
 model selection, transcript and quota behavior in
 https://github.com/magpie-community/plugins/tree/main/packages/cursor,
